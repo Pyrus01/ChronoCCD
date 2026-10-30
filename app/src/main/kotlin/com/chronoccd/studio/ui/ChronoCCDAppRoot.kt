@@ -38,6 +38,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.ToggleButton
+import androidx.compose.material3.ToggleButtonShapes
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -118,8 +119,10 @@ fun ChronoCCDAppRoot(
                         .fillMaxWidth()
                         .background(Color.Black)
                 ) {
+                    val navBarShape = FloatingToolbarDefaults.ContainerShape
                     HorizontalFloatingToolbar(
                         expanded = true,
+                        shape = navBarShape,
                         colors = FloatingToolbarDefaults.vibrantFloatingToolbarColors(
                             toolbarContainerColor = colorScheme.surfaceContainerHigh,
                             toolbarContentColor = colorScheme.onSurface
@@ -131,12 +134,18 @@ fun ChronoCCDAppRoot(
                             )
                             .zIndex(1f)
                     ) {
+                        val buttonShapes = ToggleButtonShapes(
+                            shape = navBarShape,
+                            pressedShape = navBarShape,
+                            checkedShape = navBarShape
+                        )
                         navItems.forEach { item ->
                             val selected = (uiState.currentTab == item.tab) ||
                                 (item.tab == AppTab.DARKROOM && uiState.currentTab != AppTab.CAMERA)
                             ToggleButton(
                                 checked = selected,
                                 onCheckedChange = { viewModel.selectTab(item.tab) },
+                                shapes = buttonShapes,
                                 modifier = Modifier.height(48.dp)
                             ) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
