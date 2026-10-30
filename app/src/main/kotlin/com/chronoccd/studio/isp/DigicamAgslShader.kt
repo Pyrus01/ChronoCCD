@@ -346,7 +346,7 @@ object DigicamAgslShader {
                 shader.setFloatUniform("exposureBias", spec.exposureBiasGain)
                 shader.setFloatUniform("shadowCyanGreen", spec.shadowCyanGreenTint)
                 shader.setFloatUniform("highlightMagenta", spec.highlightMagentaTilt)
-                shader.setFloatUniform("sensorLongEdge", spec.sensorLongEdgePx.toFloat())
+                shader.setFloatUniform("sensorLongEdge", if (tuning.useFullSensorResolution) 4096f else spec.sensorLongEdgePx.toFloat())
                 shader.setFloatUniform("flashActive", if (tuning.xenonFlashEnabled) 1f else 0f)
                 shader.setFloatUniform("linearTonemapActive", if (linearTonemapActive) 1f else 0f)
                 shader.setFloatUniform("blackClip", spec.blackClipLinear)

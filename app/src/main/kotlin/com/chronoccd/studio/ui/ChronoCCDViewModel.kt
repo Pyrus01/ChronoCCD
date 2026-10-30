@@ -165,6 +165,21 @@ class ChronoCCDViewModel(application: Application) : AndroidViewModel(applicatio
         reprocessCurrentImage()
     }
 
+    fun toggleFullSensorResolution() {
+        _uiState.update { state ->
+            val nextFull = !state.ispTuning.useFullSensorResolution
+            state.copy(
+                ispTuning = state.ispTuning.copy(useFullSensorResolution = nextFull),
+                statusBannerMessage = if (nextFull) {
+                    "Resolution: Full Sensor Resolution (High-Res Still)"
+                } else {
+                    "Resolution: ${state.selectedPersona.displayName} Predetermined (${state.selectedPersona.megapixelLabel})"
+                }
+            )
+        }
+        reprocessCurrentImage()
+    }
+
     fun toggleExportNativeInternalSize() {
         _uiState.update { state ->
             val nextNative = !state.ispTuning.exportNativeInternalSize
@@ -326,7 +341,7 @@ class ChronoCCDViewModel(application: Application) : AndroidViewModel(applicatio
                 item to exported
             }
 
-            val editorSourceBmp = if (maxOf(inputBmp.width, inputBmp.height) > 2048) {
+            val editorSourceBmp = if (!state.ispTuning.useFullSensorResolution && maxOf(inputBmp.width, inputBmp.height) > 2048) {
                 val scale = 2048f / maxOf(inputBmp.width, inputBmp.height).toFloat()
                 val sw = (inputBmp.width * scale).toInt().coerceAtLeast(64)
                 val sh = (inputBmp.height * scale).toInt().coerceAtLeast(64)

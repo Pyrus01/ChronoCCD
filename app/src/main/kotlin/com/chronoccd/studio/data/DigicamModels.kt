@@ -157,7 +157,8 @@ data class IspUserTuning(
     val edgeHaloUsmMultiplier: Float = 1.0f,
     val chromaticAberrationMultiplier: Float = 1.0f,
     val jpegCrunchMultiplier: Float = 1.0f,
-    val exportNativeInternalSize: Boolean = false // STEP 2: Option to export at native internal size
+    val exportNativeInternalSize: Boolean = false, // STEP 2: Option to export at native internal size
+    val useFullSensorResolution: Boolean = false  // Toggle between predetermined mode res and full sensor res
 )
 
 data class DigicamPersona(

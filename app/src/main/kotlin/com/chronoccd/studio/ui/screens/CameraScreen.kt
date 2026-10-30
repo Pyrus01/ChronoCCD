@@ -109,6 +109,7 @@ import com.chronoccd.studio.data.DigicamPersona
 import com.chronoccd.studio.isp.DemoSceneGenerator
 import com.chronoccd.studio.isp.DigicamAgslShader
 import com.chronoccd.studio.ui.ChronoCCDUiState
+import com.chronoccd.studio.ui.components.ResolutionModeToggleBadge
 import com.chronoccd.studio.ui.components.ViewfinderQuartzTimestampOverlay
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -131,6 +132,7 @@ fun CameraScreen(
     onPickGalleryUri: (android.net.Uri) -> Unit,
     onOpenEditor: () -> Unit,
     onToggleNativeSizeExport: () -> Unit = {},
+    onToggleFullSensorResolution: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -307,40 +309,16 @@ fun CameraScreen(
                     letterSpacing = 0.8.sp
                 )
 
-                // White MP square icon matching the screenshot's "12 MP" badge (tap to toggle native internal size export)
-                Surface(
-                    shape = RoundedCornerShape(5.dp),
-                    color = if (uiState.ispTuning.exportNativeInternalSize) {
-                        uiState.selectedPersona.accentColor
-                    } else {
-                        Color.White
-                    },
-                    modifier = Modifier.clickable {
+                // Dual-state resolution toggle: Mode Predetermined Res vs Full Sensor Resolution
+                ResolutionModeToggleBadge(
+                    modeLabel = uiState.selectedPersona.megapixelLabel,
+                    isFullSensorRes = uiState.ispTuning.useFullSensorResolution,
+                    accentColor = uiState.selectedPersona.accentColor,
+                    onToggle = {
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onToggleNativeSizeExport()
+                        onToggleFullSensorResolution()
                     }
-                ) {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
-                    ) {
-                        val mpNum = uiState.selectedPersona.megapixelLabel.substringBefore(" ")
-                        Text(
-                            text = mpNum,
-                            fontWeight = FontWeight.ExtraBold,
-                            fontSize = 9.sp,
-                            lineHeight = 9.sp,
-                            color = Color.Black
-                        )
-                        Text(
-                            text = "MP",
-                            fontWeight = FontWeight.ExtraBold,
-                            fontSize = 8.sp,
-                            lineHeight = 8.sp,
-                            color = Color.Black
-                        )
-                    }
-                }
+                )
             }
 
             Row(

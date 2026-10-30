@@ -55,6 +55,9 @@ import com.chronoccd.studio.isp.QuartzTimestampRenderer
 import com.chronoccd.studio.ui.theme.LocalAppFonts
 import kotlin.math.roundToInt
 
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.foundation.BorderStroke
+
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun IspTelemetryWavyHeroGauge(
@@ -391,6 +394,70 @@ fun ViewfinderQuartzTimestampOverlay(
                 imageHeight = h,
                 config = timestampConfig
             )
+        }
+    }
+}
+
+/**
+ * Compact dual-state resolution mode toggle badge for the Top Bar.
+ * Toggles between each camera mode's predetermined retro resolution (VGA, 0.8MP, 1.3MP, 2MP, 4MP)
+ * and the camera sensor's full native resolution for crystal clear high-res photos.
+ */
+@Composable
+fun ResolutionModeToggleBadge(
+    modeLabel: String,
+    isFullSensorRes: Boolean,
+    accentColor: Color,
+    onToggle: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = Color(0xFF1E1F22),
+        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.20f)),
+        modifier = modifier
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onToggle)
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(2.5.dp)
+        ) {
+            // Predetermined Mode Resolution Segment (e.g. "VGA", "0.8 MP", "1.3 MP", "2 MP", "4 MP")
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(if (!isFullSensorRes) Color.White else Color.Transparent)
+                    .padding(horizontal = 7.dp, vertical = 3.dp)
+            ) {
+                Text(
+                    text = modeLabel,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = if (!isFullSensorRes) Color.Black else Color.White.copy(alpha = 0.50f),
+                    letterSpacing = 0.3.sp
+                )
+            }
+
+            Spacer(Modifier.width(2.dp))
+
+            // Full Sensor Resolution Segment
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(if (isFullSensorRes) accentColor else Color.Transparent)
+                    .padding(horizontal = 7.dp, vertical = 3.dp)
+            ) {
+                Text(
+                    text = "FULL",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = if (isFullSensorRes) Color.White else Color.White.copy(alpha = 0.50f),
+                    letterSpacing = 0.4.sp
+                )
+            }
         }
     }
 }

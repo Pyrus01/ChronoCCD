@@ -227,7 +227,8 @@ fun ChronoCCDAppRoot(
                             },
                             onPickGalleryUri = viewModel::loadImageFromUri,
                             onOpenEditor = { viewModel.selectTab(AppTab.DARKROOM) },
-                            onToggleNativeSizeExport = viewModel::toggleExportNativeInternalSize
+                            onToggleNativeSizeExport = viewModel::toggleExportNativeInternalSize,
+                            onToggleFullSensorResolution = viewModel::toggleFullSensorResolution
                         )
 
                         else -> EditorScreen(
@@ -243,6 +244,7 @@ fun ChronoCCDAppRoot(
                             onCycleTimestampFormat = {
                                 viewModel.cycleTimestampStyle()
                             },
+                            onToggleFullSensorResolution = viewModel::toggleFullSensorResolution,
                             onSetShowOriginal = viewModel::setShowOriginalComparison,
                             onPickGalleryUri = viewModel::loadImageFromUri,
                             onSaveToGallery = viewModel::saveCurrentToRollAndGallery,

@@ -77,6 +77,7 @@ import androidx.compose.ui.unit.sp
 import com.chronoccd.studio.data.DigicamPersona
 import com.chronoccd.studio.data.NostalgicDigicamCatalog
 import com.chronoccd.studio.ui.ChronoCCDUiState
+import com.chronoccd.studio.ui.components.ResolutionModeToggleBadge
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
@@ -91,6 +92,7 @@ fun EditorScreen(
     onToggleXenonFlash: () -> Unit,
     onToggleTimestamp: () -> Unit,
     onCycleTimestampFormat: () -> Unit,
+    onToggleFullSensorResolution: () -> Unit = {},
     onSetShowOriginal: (Boolean) -> Unit,
     onPickGalleryUri: (android.net.Uri) -> Unit,
     onSaveToGallery: () -> Unit,
@@ -147,31 +149,16 @@ fun EditorScreen(
                     letterSpacing = 0.8.sp
                 )
 
-                Surface(
-                    shape = RoundedCornerShape(5.dp),
-                    color = Color.White
-                ) {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
-                    ) {
-                        val mpNum = uiState.selectedPersona.megapixelLabel.substringBefore(" ")
-                        Text(
-                            text = mpNum,
-                            fontWeight = FontWeight.ExtraBold,
-                            fontSize = 9.sp,
-                            lineHeight = 9.sp,
-                            color = Color.Black
-                        )
-                        Text(
-                            text = "MP",
-                            fontWeight = FontWeight.ExtraBold,
-                            fontSize = 8.sp,
-                            lineHeight = 8.sp,
-                            color = Color.Black
-                        )
+                // Dual-state resolution toggle: Mode Predetermined Res vs Full Sensor Resolution
+                ResolutionModeToggleBadge(
+                    modeLabel = uiState.selectedPersona.megapixelLabel,
+                    isFullSensorRes = uiState.ispTuning.useFullSensorResolution,
+                    accentColor = uiState.selectedPersona.accentColor,
+                    onToggle = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onToggleFullSensorResolution()
                     }
-                }
+                )
             }
 
             Row(

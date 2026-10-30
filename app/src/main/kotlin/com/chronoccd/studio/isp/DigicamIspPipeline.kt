@@ -87,25 +87,42 @@ object DigicamIspPipeline {
         val srcW = source.width.coerceAtLeast(1)
         val srcH = source.height.coerceAtLeast(1)
 
-        // Step 1: Determine Per-Mode Internal Sensor Resolution (VGA 640, 0.8MP 960, 1.3MP 1280, 2MP 1600, 4MP 2048)
-        val internalLongEdge = (spec.sensorLongEdgePx * tuning.sensorPitchMultiplier)
-            .roundToInt()
-            .coerceIn(480, 2048)
-        val internalScale = internalLongEdge.toFloat() / max(srcW, srcH).toFloat()
-        val sensorW = (((srcW * internalScale).roundToInt().coerceAtLeast(64)) / 2) * 2
-        val sensorH = (((srcH * internalScale).roundToInt().coerceAtLeast(64)) / 2) * 2
+        // Step 1: Determine Internal Resolution:
+        // Either full sensor resolution or each color mode's predetermined internal resolution (VGA 640, 0.8MP 960, 1.3MP 1280, 2MP 1600, 4MP 2048)
+        val sensorW: Int
+        val sensorH: Int
+        if (tuning.useFullSensorResolution) {
+            sensorW = (srcW / 2) * 2
+            sensorH = (srcH / 2) * 2
+        } else {
+            val internalLongEdge = (spec.sensorLongEdgePx * tuning.sensorPitchMultiplier)
+                .roundToInt()
+                .coerceIn(480, 2048)
+            val internalScale = internalLongEdge.toFloat() / max(srcW, srcH).toFloat()
+            sensorW = (((srcW * internalScale).roundToInt().coerceAtLeast(64)) / 2) * 2
+            sensorH = (((srcH * internalScale).roundToInt().coerceAtLeast(64)) / 2) * 2
+        }
 
         // Multi-step pre-downsample + Optical Low-Pass Filter (OLPF) so high-res phone detail is low-passed before hitting the CCD grid
-        val preW = min(srcW, sensorW * 2).coerceAtLeast(sensorW)
-        val preH = min(srcH, sensorH * 2).coerceAtLeast(sensorH)
-        val preBitmap = if (preW < srcW || preH < srcH) {
-            Bitmap.createScaledBitmap(source, preW, preH, true)
+        val sensorBitmap = if (tuning.useFullSensorResolution) {
+            if (source.width != sensorW || source.height != sensorH) {
+                Bitmap.createScaledBitmap(source, sensorW, sensorH, true)
+            } else {
+                source
+            }
         } else {
-            source
-        }
-        val sensorBitmap = Bitmap.createScaledBitmap(preBitmap, sensorW, sensorH, true)
-        if (preBitmap !== source && preBitmap !== sensorBitmap) {
-            preBitmap.recycle()
+            val preW = min(srcW, sensorW * 2).coerceAtLeast(sensorW)
+            val preH = min(srcH, sensorH * 2).coerceAtLeast(sensorH)
+            val preBitmap = if (preW < srcW || preH < srcH) {
+                Bitmap.createScaledBitmap(source, preW, preH, true)
+            } else {
+                source
+            }
+            val scaled = Bitmap.createScaledBitmap(preBitmap, sensorW, sensorH, true)
+            if (preBitmap !== source && preBitmap !== scaled) {
+                preBitmap.recycle()
+            }
+            scaled
         }
 
         val numPixels = sensorW * sensorH
@@ -161,7 +178,7 @@ object DigicamIspPipeline {
         val shotExposureDrift = 1f + ((imageSignature % 13) - 6) * 0.003f
 
         // Scale spatial radii proportionally to internal sensor size
-        val resScale = (max(sensorW, sensorH) / 1280f).coerceIn(0.5f, 1.6f)
+        val resScale = (max(sensorW, sensorH) / 1280f).coerceIn(0.5f, if (tuning.useFullSensorResolution) 3.5f else 1.6f)
         val cornerSigma = (1.6f * resScale).coerceIn(1.2f, 2.4f)
         val nrRadius = (2f * resScale).roundToInt().coerceIn(1, 3)
 
@@ -559,11 +576,11 @@ object DigicamIspPipeline {
         }
 
         // STEP 2: Upscale to 1080x1440 ONLY at the end using Lanczos-3 (never bilinear),
-        // or keep native internal size if tuning.exportNativeInternalSize is enabled.
+        // or keep full sensor resolution / native internal size when enabled.
         val finalOutputBmp: Bitmap
         val outW: Int
         val outH: Int
-        if (tuning.exportNativeInternalSize) {
+        if (tuning.useFullSensorResolution || tuning.exportNativeInternalSize) {
             outW = sensorW
             outH = sensorH
             finalOutputBmp = decodedInternalBmp
