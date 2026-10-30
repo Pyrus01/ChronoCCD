@@ -110,11 +110,16 @@ data class DigicamIspSpec(
     val sensorLongEdgePx: Int = 1600,           // Internal resolution long edge: 640 (VGA), 960 (0.8MP), 1280 (1.3MP), 1600 (2MP), 2048 (4MP)
     val sensorPitchScale: Float,                // 0.65..0.95
     val olpfLowPassStrength: Float = 0.65f,     // Gaussian low-pass sigma before downsampling to internal size
-    val cornerSoftness: Float = 0.35f,          // 0.20..0.58 (center okay, corners mushy)
-    val edgeCaFringingPx: Float = 1.6f,         // 0.8..2.6 (purple/green fringing on high-contrast corner edges)
-    val barrelDistortion: Float = 0.028f,       // 0.015..0.045 (compact wide-end barrel distortion)
-    val lensVignette: Float = 0.12f,            // 0.08..0.18 (mild optical falloff)
+    val cornerSoftness: Float = 0.24f,          // STEP 6: Mild corner softness in all modes (0.18..0.30)
+    val caKr: Float = 0.00120f,                 // STEP 6: Lateral CA R scale = 1 + k_r*r^2 (k_r > 0, 1-2 px corner shift)
+    val caKb: Float = 0.00130f,                 // STEP 6: Lateral CA B scale = 1 - k_b*r^2 (k_b > 0, 1-2 px corner shift)
+    val edgeCaFringingPx: Float = 1.25f,        // STEP 6: Max corner shift in internal resolution pixels (1.0..2.0 px)
+    val barrelDistortion: Float = 0.028f,       // STEP 6: Consistent barrel distortion in all modes
+    val lensVignette: Float = 0.06f,            // STEP 6: Halved vignette strength (0.055..0.080)
     val veilingFlare: Float = 0.04f,            // 0.02..0.08 (subtle veiling haze from bright light sources)
+    val pointLightBloomThreshold: Float = 0.82f,// STEP 6: Point-light bloom threshold luma > 0.82
+    val pointLightBloomSigmaPx: Float = 3.0f,   // STEP 6: Point-light bloom Gaussian blur sigma ~3 px
+    val blueVioletFringeStrength: Float = 0.15f,// STEP 6: Blue-violet fringing on dark side of edges (0.10..0.20)
     val blackClipLinear: Float = 0.035f,        // STEP 3: Linear black clip (0.03..0.05) applied first
     val exposureBiasGain: Float = 1.50f,        // STEP 3: Pre-clip exposure gain (1.4..1.8x per mode)
     val whiteClipLinear: Float = 0.78f,         // STEP 3: Linear white clip (0.72..0.82 per mode), no top shoulder
@@ -135,8 +140,9 @@ data class DigicamIspSpec(
     val sigmaLumaFloor: Float = 0.018f,         // STEP 4: Constant luma read noise floor (0.014 highest-res .. 0.030 lowest-res) after black crush
     val shadowChromaSpeckle: Float,             // STEP 4: 1/4-res bilinearly upsampled Cb/Cr blotch sigma (0.025 highest-res .. 0.045 lowest-res)
     val deClaritySoftness: Float,               // STEP 4: Smeary in-camera NR applied after the noise step
-    val usmCrispness: Float,                    // 0.35..1.25 (distinct per-mode USM sharpening strength)
-    val usmHaloLimit: Float = 0.09f,            // 0.04..0.15 (distinct per-mode edge halo overshoot cap)
+    val usmRadiusPx: Float = 1.25f,             // STEP 5: Luma USM radius 1.0..1.5 px at internal resolution
+    val usmCrispness: Float,                    // STEP 5: Luma USM strength (halo amount reduced by ~40% in every mode)
+    val usmHaloLimit: Float = 0.054f,           // STEP 5: Per-mode edge halo overshoot cap (reduced by ~40% in every mode)
     val jpegQuality: Int,                       // STEP 2: 60..86 (internal JPEG encode/decode quality)
     val finalExportJpegQuality: Int = 95        // STEP 2: Final saved file quality Q >= 92
 )
@@ -193,11 +199,16 @@ val NostalgicDigicamCatalog: List<DigicamPersona> = listOf(
             sensorLongEdgePx = 1600,
             sensorPitchScale = 0.85f,
             olpfLowPassStrength = 0.55f,
-            cornerSoftness = 0.28f,
-            edgeCaFringingPx = 1.3f,
-            barrelDistortion = 0.022f,
-            lensVignette = 0.12f,
+            cornerSoftness = 0.21f,
+            caKr = 0.00120f,
+            caKb = 0.00130f,
+            edgeCaFringingPx = 1.25f,
+            barrelDistortion = 0.028f,
+            lensVignette = 0.060f,
             veilingFlare = 0.03f,
+            pointLightBloomThreshold = 0.82f,
+            pointLightBloomSigmaPx = 3.0f,
+            blueVioletFringeStrength = 0.125f,
             blackClipLinear = 0.035f,
             exposureBiasGain = 1.50f,
             whiteClipLinear = 0.745f,
@@ -211,19 +222,20 @@ val NostalgicDigicamCatalog: List<DigicamPersona> = listOf(
             ),
             shadowCyanGreenTint = 0.01f,
             highlightMagentaTilt = 0.02f,
-            saturationBoost = 1.16f,
+            saturationBoost = 0.986f,
             shadowRollOff = 0.32f,
             highlightShoulder = 0.745f,
             midtoneGamma = 0.86f,
-            toneContrast = 0.34f,
+            toneContrast = 0.306f,
             highlightBloomAmount = 0.08f,
             verticalSmearStrength = 0.04f,
             fineLumaGrain = 0.013f,
             sigmaLumaFloor = 0.018f,
             shadowChromaSpeckle = 0.030f,
             deClaritySoftness = 0.34f,
-            usmCrispness = 0.72f,
-            usmHaloLimit = 0.09f,
+            usmRadiusPx = 1.12f,
+            usmCrispness = 0.43f,
+            usmHaloLimit = 0.054f,
             jpegQuality = 79
         )
     ),
@@ -248,11 +260,16 @@ val NostalgicDigicamCatalog: List<DigicamPersona> = listOf(
             sensorLongEdgePx = 640,
             sensorPitchScale = 0.72f,
             olpfLowPassStrength = 0.85f,
-            cornerSoftness = 0.42f,
-            edgeCaFringingPx = 1.8f,
-            barrelDistortion = 0.032f,
-            lensVignette = 0.15f,
+            cornerSoftness = 0.30f,
+            caKr = 0.00475f,
+            caKb = 0.00500f,
+            edgeCaFringingPx = 2.00f,
+            barrelDistortion = 0.028f,
+            lensVignette = 0.075f,
             veilingFlare = 0.04f,
+            pointLightBloomThreshold = 0.82f,
+            pointLightBloomSigmaPx = 3.0f,
+            blueVioletFringeStrength = 0.200f,
             blackClipLinear = 0.050f,
             exposureBiasGain = 1.80f,
             whiteClipLinear = 0.82f,
@@ -266,19 +283,20 @@ val NostalgicDigicamCatalog: List<DigicamPersona> = listOf(
             ),
             shadowCyanGreenTint = 0.055f,
             highlightMagentaTilt = 0.035f,
-            saturationBoost = 1.24f,
+            saturationBoost = 1.054f,
             shadowRollOff = 0.40f,
             highlightShoulder = 0.82f,
             midtoneGamma = 0.82f,
-            toneContrast = 0.44f,
+            toneContrast = 0.396f,
             highlightBloomAmount = 0.11f,
             verticalSmearStrength = 0.07f,
             fineLumaGrain = 0.022f,
             sigmaLumaFloor = 0.030f,
             shadowChromaSpeckle = 0.045f,
             deClaritySoftness = 0.30f,
-            usmCrispness = 1.18f,
-            usmHaloLimit = 0.14f,
+            usmRadiusPx = 1.50f,
+            usmCrispness = 0.71f,
+            usmHaloLimit = 0.084f,
             jpegQuality = 62
         )
     ),
@@ -303,11 +321,16 @@ val NostalgicDigicamCatalog: List<DigicamPersona> = listOf(
             sensorLongEdgePx = 2048,
             sensorPitchScale = 0.90f,
             olpfLowPassStrength = 0.40f,
-            cornerSoftness = 0.24f,
-            edgeCaFringingPx = 1.1f,
-            barrelDistortion = 0.020f,
-            lensVignette = 0.11f,
+            cornerSoftness = 0.18f,
+            caKr = 0.00078f,
+            caKb = 0.00084f,
+            edgeCaFringingPx = 1.00f,
+            barrelDistortion = 0.028f,
+            lensVignette = 0.055f,
             veilingFlare = 0.03f,
+            pointLightBloomThreshold = 0.82f,
+            pointLightBloomSigmaPx = 3.0f,
+            blueVioletFringeStrength = 0.100f,
             blackClipLinear = 0.030f,
             exposureBiasGain = 1.40f,
             whiteClipLinear = 0.72f,
@@ -321,19 +344,20 @@ val NostalgicDigicamCatalog: List<DigicamPersona> = listOf(
             ),
             shadowCyanGreenTint = 0.065f,
             highlightMagentaTilt = 0.01f,
-            saturationBoost = 1.26f,
+            saturationBoost = 1.071f,
             shadowRollOff = 0.28f,
             highlightShoulder = 0.72f,
             midtoneGamma = 0.91f,
-            toneContrast = 0.32f,
+            toneContrast = 0.288f,
             highlightBloomAmount = 0.07f,
             verticalSmearStrength = 0.03f,
             fineLumaGrain = 0.010f,
             sigmaLumaFloor = 0.014f,
             shadowChromaSpeckle = 0.025f,
             deClaritySoftness = 0.40f,
-            usmCrispness = 0.36f,
-            usmHaloLimit = 0.05f,
+            usmRadiusPx = 1.00f,
+            usmCrispness = 0.22f,
+            usmHaloLimit = 0.030f,
             jpegQuality = 86
         )
     ),
@@ -358,11 +382,16 @@ val NostalgicDigicamCatalog: List<DigicamPersona> = listOf(
             sensorLongEdgePx = 1280,
             sensorPitchScale = 0.78f,
             olpfLowPassStrength = 0.70f,
-            cornerSoftness = 0.54f,
-            edgeCaFringingPx = 2.4f,
-            barrelDistortion = 0.036f,
-            lensVignette = 0.16f,
+            cornerSoftness = 0.24f,
+            caKr = 0.00181f,
+            caKb = 0.00194f,
+            edgeCaFringingPx = 1.50f,
+            barrelDistortion = 0.028f,
+            lensVignette = 0.080f,
             veilingFlare = 0.05f,
+            pointLightBloomThreshold = 0.82f,
+            pointLightBloomSigmaPx = 3.0f,
+            blueVioletFringeStrength = 0.150f,
             blackClipLinear = 0.040f,
             exposureBiasGain = 1.60f,
             whiteClipLinear = 0.77f,
@@ -376,19 +405,20 @@ val NostalgicDigicamCatalog: List<DigicamPersona> = listOf(
             ),
             shadowCyanGreenTint = -0.04f,
             highlightMagentaTilt = 0.055f,
-            saturationBoost = 1.10f,
+            saturationBoost = 0.935f,
             shadowRollOff = 0.36f,
             highlightShoulder = 0.77f,
             midtoneGamma = 0.84f,
-            toneContrast = 0.36f,
+            toneContrast = 0.324f,
             highlightBloomAmount = 0.10f,
             verticalSmearStrength = 0.06f,
             fineLumaGrain = 0.016f,
             sigmaLumaFloor = 0.022f,
             shadowChromaSpeckle = 0.035f,
             deClaritySoftness = 0.58f,
-            usmCrispness = 0.44f,
-            usmHaloLimit = 0.06f,
+            usmRadiusPx = 1.25f,
+            usmCrispness = 0.26f,
+            usmHaloLimit = 0.036f,
             jpegQuality = 73
         )
     ),
@@ -413,11 +443,16 @@ val NostalgicDigicamCatalog: List<DigicamPersona> = listOf(
             sensorLongEdgePx = 960,
             sensorPitchScale = 0.75f,
             olpfLowPassStrength = 0.78f,
-            cornerSoftness = 0.46f,
-            edgeCaFringingPx = 2.0f,
-            barrelDistortion = 0.030f,
-            lensVignette = 0.16f,
+            cornerSoftness = 0.27f,
+            caKr = 0.00283f,
+            caKb = 0.00300f,
+            edgeCaFringingPx = 1.75f,
+            barrelDistortion = 0.028f,
+            lensVignette = 0.080f,
             veilingFlare = 0.04f,
+            pointLightBloomThreshold = 0.82f,
+            pointLightBloomSigmaPx = 3.0f,
+            blueVioletFringeStrength = 0.175f,
             blackClipLinear = 0.045f,
             exposureBiasGain = 1.70f,
             whiteClipLinear = 0.795f,
@@ -431,19 +466,20 @@ val NostalgicDigicamCatalog: List<DigicamPersona> = listOf(
             ),
             shadowCyanGreenTint = -0.03f,
             highlightMagentaTilt = 0.04f,
-            saturationBoost = 1.30f,
+            saturationBoost = 1.105f,
             shadowRollOff = 0.42f,
             highlightShoulder = 0.795f,
             midtoneGamma = 0.82f,
-            toneContrast = 0.45f,
+            toneContrast = 0.405f,
             highlightBloomAmount = 0.12f,
             verticalSmearStrength = 0.08f,
             fineLumaGrain = 0.019f,
             sigmaLumaFloor = 0.026f,
             shadowChromaSpeckle = 0.040f,
             deClaritySoftness = 0.48f,
-            usmCrispness = 0.94f,
-            usmHaloLimit = 0.12f,
+            usmRadiusPx = 1.38f,
+            usmCrispness = 0.56f,
+            usmHaloLimit = 0.072f,
             jpegQuality = 66
         )
     )

@@ -30,13 +30,17 @@ object DigicamAgslShader {
         uniform float invGamma;
         uniform float toneContrast;
         uniform float deClarity;
+        uniform float usmRadiusPx;
         uniform float usmCrisp;
         uniform float usmHaloCap;
         uniform float highlightBloom;
+        uniform float bloomThreshold;
+        uniform float blueVioletFringe;
         uniform float fineGrain;
         uniform float chromaBlotch;
         uniform float cornerSoftness;
-        uniform float caFringePx;
+        uniform float caKr;
+        uniform float caKb;
         uniform float barrelK;
         uniform float vignetteWeight;
         uniform float exposureBias;
@@ -116,63 +120,80 @@ object DigicamAgslShader {
         half4 main(float2 fragCoord) {
             float2 res = max(resolution, float2(64.0, 64.0));
             float2 uv = fragCoord / res - 0.5;
-            float rSq = dot(uv, uv);
+            // Normalized r^2 in [0.0, 1.0] from center to corners
+            float rSq = 2.0 * dot(uv, uv);
 
-            // 1. Barrel distortion & Per-Mode Internal Resolution Grid (VGA 640 .. 4MP 2048)
-            float barrelScale = 1.0 - barrelK * (rSq * 2.0);
+            // STEP 6: Consistent barrel distortion across all modes
+            float barrelScale = (1.0 + barrelK * rSq) / (1.0 + barrelK);
+            float2 bUv = uv * barrelScale;
             float maxRes = max(res.x, res.y);
             float pixelGridStep = max(1.0, maxRes / max(480.0, sensorLongEdge));
-            float2 rawBCoord = (uv * barrelScale + 0.5) * res;
-            // Subtle bilinear-quantized internal sensor sampling
+            float2 rawBCoord = (bUv + 0.5) * res;
             float2 quantCoord = (floor(rawBCoord / pixelGridStep) + 0.5) * pixelGridStep;
             float2 bCoord = clamp(mix(rawBCoord, quantCoord, 0.55), float2(1.0), res - float2(1.0));
 
-            // 4-tap neighborhood scaled by the mode's internal pixel pitch
-            float stepPx = max(1.4, pixelGridStep * 1.35);
+            // STEP 6: Lateral CA: R scale = 1 + k_r*r^2, B scale = 1 - k_b*r^2 (k_r > 0, k_b > 0)
+            float rScale = 1.0 + caKr * rSq;
+            float bScale = 1.0 - caKb * rSq;
+            float2 rCoord = clamp((bUv * rScale + 0.5) * res, float2(1.0), res - float2(1.0));
+            float2 bCoordCa = clamp((bUv * bScale + 0.5) * res, float2(1.0), res - float2(1.0));
+
+            float rSample = content.eval(rCoord).r;
+            float bSample = content.eval(bCoordCa).b;
             float3 cCenter = decodeInputToLinear(content.eval(bCoord).rgb);
-            float3 cU = decodeInputToLinear(content.eval(clamp(bCoord - float2(0.0, stepPx), float2(0.0), res)).rgb);
-            float3 cD = decodeInputToLinear(content.eval(clamp(bCoord + float2(0.0, stepPx), float2(0.0), res)).rgb);
-            float3 cL = decodeInputToLinear(content.eval(clamp(bCoord - float2(stepPx, 0.0), float2(0.0), res)).rgb);
-            float3 cR = decodeInputToLinear(content.eval(clamp(bCoord + float2(stepPx, 0.0), float2(0.0), res)).rgb);
-            float3 meanLin = 0.25 * (cU + cD + cL + cR);
-
-            // 2. Edge-gated Purple/Green Chromatic Aberration + Corner Softness in linear space
-            float yL = dot(cL, float3(0.2126, 0.7152, 0.0722));
-            float yR = dot(cR, float3(0.2126, 0.7152, 0.0722));
-            float yU = dot(cU, float3(0.2126, 0.7152, 0.0722));
-            float yD = dot(cD, float3(0.2126, 0.7152, 0.0722));
-            float edgeGrad = abs(yR - yL) + abs(yD - yU);
-            float edgeGate = clamp((edgeGrad - 0.05) * 4.5, 0.0, 1.0);
-
-            float radialDist = sqrt(rSq * 2.0);
-            float2 caShift = uv * radialDist * caFringePx * stepPx * (0.35 + 0.65 * edgeGate);
-            float rSample = content.eval(clamp(bCoord + caShift, float2(0.0), res)).r;
-            float bSample = content.eval(clamp(bCoord - caShift * 1.15, float2(0.0), res)).b;
             float rCa = (linearTonemapActive > 0.5) ? clamp(rSample, 0.0, 1.0) : srgbChannelToLinear(rSample);
             float bCa = (linearTonemapActive > 0.5) ? clamp(bSample, 0.0, 1.0) : srgbChannelToLinear(bSample);
             float3 colLin = float3(rCa, cCenter.g, bCa);
 
-            // Soft corners (mushy outer lens edges)
-            float cornerMask = clamp((rSq * 2.4 - 0.22) / 0.78, 0.0, 1.0) * cornerSoftness;
+            // Neighborhood at USM radius (1.0 - 1.5 px at internal resolution)
+            float usmStepPx = max(1.0, pixelGridStep * clamp(usmRadiusPx, 1.0, 1.5));
+            float3 cU = decodeInputToLinear(content.eval(clamp(bCoord - float2(0.0, usmStepPx), float2(0.0), res)).rgb);
+            float3 cD = decodeInputToLinear(content.eval(clamp(bCoord + float2(0.0, usmStepPx), float2(0.0), res)).rgb);
+            float3 cL = decodeInputToLinear(content.eval(clamp(bCoord - float2(usmStepPx, 0.0), float2(0.0), res)).rgb);
+            float3 cR = decodeInputToLinear(content.eval(clamp(bCoord + float2(usmStepPx, 0.0), float2(0.0), res)).rgb);
+            float3 meanLin = 0.25 * (cU + cD + cL + cR);
+
+            // Neighborhood at sigma ~ 3 px for point-light bloom
+            float bloomStepPx = max(2.5, pixelGridStep * 3.0);
+            float3 bU = decodeInputToLinear(content.eval(clamp(bCoord - float2(0.0, bloomStepPx), float2(0.0), res)).rgb);
+            float3 bD = decodeInputToLinear(content.eval(clamp(bCoord + float2(0.0, bloomStepPx), float2(0.0), res)).rgb);
+            float3 bL = decodeInputToLinear(content.eval(clamp(bCoord - float2(bloomStepPx, 0.0), float2(0.0), res)).rgb);
+            float3 bR = decodeInputToLinear(content.eval(clamp(bCoord + float2(bloomStepPx, 0.0), float2(0.0), res)).rgb);
+            float3 bloomMeanLin = 0.20 * (cCenter + bU + bD + bL + bR);
+
+            // STEP 6: Mild corner softness in outer field
+            float cornerMask = clamp((rSq - 0.30) / 0.70, 0.0, 1.0) * cornerSoftness;
             colLin = mix(colLin, meanLin, cornerMask);
 
-            // 3. Direct Flash Hotspot & Mixed-Light Color vs Optical Vignette
+            // STEP 6: Halved Vignette vs Flash Hotspot
             if (flashActive > 0.5) {
-                float flashFalloff = clamp(rSq * 2.5, 0.0, 1.0);
+                float flashFalloff = clamp(rSq * 1.25, 0.0, 1.0);
                 float env = 1.06 - 0.76 * flashFalloff;
                 colLin.r *= env * (0.96 + 0.14 * flashFalloff);
                 colLin.g *= env;
                 colLin.b *= env * (1.06 - 0.18 * flashFalloff);
             } else {
-                float vig = 1.0 - vignetteWeight * clamp(rSq * 2.1, 0.0, 1.0);
+                float vig = 1.0 - vignetteWeight * clamp(rSq, 0.0, 1.0);
                 colLin *= vig;
                 meanLin *= vig;
+                bloomMeanLin *= vig;
             }
 
-            // 4. Early Highlight Bloom in Linear Space
-            float yMeanLin = dot(meanLin, float3(0.2126, 0.7152, 0.0722)) * exposureBias;
-            float hiEx = clamp((yMeanLin - whiteClip) / max(0.15, 1.05 - whiteClip), 0.0, 1.5);
+            // STEP 6: Point-light bloom (threshold luma > 0.82, sigma ~3 px) & dark-side blue-violet fringing (10-20%)
+            float yCurrPre = dot(colLin, float3(0.2126, 0.7152, 0.0722)) * exposureBias;
+            float yBloomPre = dot(bloomMeanLin, float3(0.2126, 0.7152, 0.0722)) * exposureBias;
+            float hiEx = clamp((yBloomPre - bloomThreshold) / max(0.10, 1.0 - bloomThreshold), 0.0, 1.5);
             colLin += float3(1.0, 0.98, 1.04) * (hiEx * highlightBloom);
+
+            float darkSideEdge = max(0.0, yBloomPre - yCurrPre);
+            float darkSideMask = pow(1.0 - clamp(yCurrPre / bloomThreshold, 0.0, 1.0), 2.0);
+            float fringeSig = max(hiEx * darkSideMask, darkSideEdge * clamp((yBloomPre - 0.45) / 0.40, 0.0, 1.0) * 1.35);
+            if (fringeSig > 0.001) {
+                float bv = fringeSig * blueVioletFringe;
+                colLin.r += bv * 0.48;
+                colLin.g = max(0.0, colLin.g - bv * 0.22);
+                colLin.b += bv * 1.00;
+            }
 
             // STEP 3.1: Black clip 0.03-0.05 first in linear space
             float invBlackSpan = 1.0 / max(0.5, 1.0 - blackClip);
@@ -253,14 +274,16 @@ object DigicamAgslShader {
             cb += nCb;
             cr += nCr;
 
-            // STEP 4.3: Smeary NR after the noise step + Edge-Halo USM
+            // STEP 4.3 & STEP 5: Smeary NR after the noise step + Luma USM (radius 1-1.5 px at internal res, ~40% reduced halo)
             float dY = yToned - yMeanToned;
             if (abs(dY) < 0.085) {
                 float t = 1.0 - (abs(dY) / 0.085);
                 float shadowKeep = (1.0 - yMeanToned) * (1.0 - yMeanToned) * 0.55;
                 yToned = mix(yToned, yMeanToned, deClarity * t * (1.0 - shadowKeep));
-            } else {
-                float halo = clamp(dY * usmCrisp * 1.35, -usmHaloCap, usmHaloCap);
+            }
+            float edgeDelta = yToned - yMeanToned;
+            if (abs(edgeDelta) > 0.010) {
+                float halo = clamp(edgeDelta * usmCrisp, -usmHaloCap, usmHaloCap);
                 yToned = clamp(yToned + halo, 0.0, 1.0);
             }
 
@@ -307,13 +330,17 @@ object DigicamAgslShader {
                 shader.setFloatUniform("invGamma", 1f / spec.midtoneGamma.coerceIn(0.75f, 1.35f))
                 shader.setFloatUniform("toneContrast", spec.toneContrast)
                 shader.setFloatUniform("deClarity", spec.deClaritySoftness)
-                shader.setFloatUniform("usmCrisp", spec.usmCrispness)
-                shader.setFloatUniform("usmHaloCap", spec.usmHaloLimit)
-                shader.setFloatUniform("highlightBloom", spec.highlightBloomAmount)
-                shader.setFloatUniform("fineGrain", spec.fineLumaGrain)
-                shader.setFloatUniform("chromaBlotch", spec.shadowChromaSpeckle)
+                shader.setFloatUniform("usmRadiusPx", spec.usmRadiusPx)
+                shader.setFloatUniform("usmCrisp", spec.usmCrispness * tuning.edgeHaloUsmMultiplier)
+                shader.setFloatUniform("usmHaloCap", spec.usmHaloLimit * tuning.edgeHaloUsmMultiplier)
+                shader.setFloatUniform("highlightBloom", spec.highlightBloomAmount * tuning.bloomAndSmearMultiplier)
+                shader.setFloatUniform("bloomThreshold", spec.pointLightBloomThreshold)
+                shader.setFloatUniform("blueVioletFringe", spec.blueVioletFringeStrength * tuning.chromaticAberrationMultiplier)
+                shader.setFloatUniform("fineGrain", spec.fineLumaGrain * tuning.ccdNoiseMultiplier)
+                shader.setFloatUniform("chromaBlotch", spec.shadowChromaSpeckle * tuning.ccdNoiseMultiplier)
                 shader.setFloatUniform("cornerSoftness", spec.cornerSoftness)
-                shader.setFloatUniform("caFringePx", spec.edgeCaFringingPx)
+                shader.setFloatUniform("caKr", spec.caKr * tuning.chromaticAberrationMultiplier)
+                shader.setFloatUniform("caKb", spec.caKb * tuning.chromaticAberrationMultiplier)
                 shader.setFloatUniform("barrelK", spec.barrelDistortion)
                 shader.setFloatUniform("vignetteWeight", spec.lensVignette)
                 shader.setFloatUniform("exposureBias", spec.exposureBiasGain)
@@ -324,7 +351,7 @@ object DigicamAgslShader {
                 shader.setFloatUniform("linearTonemapActive", if (linearTonemapActive) 1f else 0f)
                 shader.setFloatUniform("blackClip", spec.blackClipLinear)
                 shader.setFloatUniform("whiteClip", spec.whiteClipLinear)
-                shader.setFloatUniform("sigmaLumaFloor", spec.sigmaLumaFloor)
+                shader.setFloatUniform("sigmaLumaFloor", spec.sigmaLumaFloor * tuning.ccdNoiseMultiplier)
 
                 RenderEffect.createRuntimeShaderEffect(shader, "content").asComposeRenderEffect()
             }.getOrNull()

@@ -162,27 +162,34 @@ object DigicamIspPipeline {
 
         // Scale spatial radii proportionally to internal sensor size
         val resScale = (max(sensorW, sensorH) / 1280f).coerceIn(0.5f, 1.6f)
-        val cornerRadius = (3f * resScale).roundToInt().coerceIn(2, 5)
-        val bloomRadius = (5f * resScale).roundToInt().coerceIn(3, 8)
+        val cornerSigma = (1.6f * resScale).coerceIn(1.2f, 2.4f)
         val nrRadius = (2f * resScale).roundToInt().coerceIn(1, 3)
-        val usmRadius = (2f * resScale).roundToInt().coerceIn(1, 3)
 
-        // Stage 2: Lens Effects in Linear Space at Internal Size (reuse rOlpfBlur/gOlpfBlur/bOlpfBlur buffers)
-        val rBlurCorner = boxBlurSeparable(rLin, sensorW, sensorH, cornerRadius, blurTmp, rOlpfBlur)
-        val gBlurCorner = boxBlurSeparable(gLin, sensorW, sensorH, cornerRadius, blurTmp, gOlpfBlur)
-        val bBlurCorner = boxBlurSeparable(bLin, sensorW, sensorH, cornerRadius, blurTmp, bOlpfBlur)
+        // STEP 6: Lens Effects in Linear Space at Internal Size
+        // - Mild corner softness in all modes
+        // - Consistent barrel distortion in all modes
+        // - Lateral CA: R scale = 1 + k_r*r^2, B scale = 1 - k_b*r^2 (k_r > 0, k_b > 0, max shift 1-2 px at corners)
+        // - Halved vignette strength
+        val rBlurCorner = gaussianBlurSeparable(rLin, sensorW, sensorH, cornerSigma, blurTmp, rOlpfBlur)
+        val gBlurCorner = gaussianBlurSeparable(gLin, sensorW, sensorH, cornerSigma, blurTmp, gOlpfBlur)
+        val bBlurCorner = gaussianBlurSeparable(bLin, sensorW, sensorH, cornerSigma, blurTmp, bOlpfBlur)
 
-        val cornerSoftWeight = (spec.cornerSoftness * strength).coerceIn(0f, 0.75f)
-        val caFringePx = (spec.edgeCaFringingPx * resScale * tuning.chromaticAberrationMultiplier * strength).coerceIn(0f, 4.0f)
+        val cornerSoftWeight = (spec.cornerSoftness * strength).coerceIn(0f, 0.45f)
+        val caMult = (tuning.chromaticAberrationMultiplier * strength).coerceIn(0f, 2.0f)
+        val kR = (spec.caKr * caMult).coerceAtLeast(0f)
+        val kB = (spec.caKb * caMult).coerceAtLeast(0f)
         val barrelK = (spec.barrelDistortion * strength).coerceIn(0f, 0.06f)
-        val vignetteWeight = (spec.lensVignette * strength).coerceIn(0f, 0.22f)
+        val invBarrelNorm = 1f / (1f + barrelK)
+        val vignetteWeight = (spec.lensVignette * strength).coerceIn(0f, 0.12f)
         val veilingWeight = (spec.veilingFlare * strength).coerceIn(0f, 0.16f)
 
         val rLens = FloatArray(numPixels)
         val gLens = FloatArray(numPixels)
         val bLens = FloatArray(numPixels)
 
-        val highlightClipLin = (spec.whiteClipLinear * (if (tuning.xenonFlashEnabled) 0.94f else 1.0f)).coerceIn(0.68f, 0.85f)
+        // STEP 6: Point-light bloom threshold luma > 0.82
+        val bloomThreshold = spec.pointLightBloomThreshold.coerceIn(0.75f, 0.90f)
+        val invBloomSpan = 1f / (1f - bloomThreshold).coerceAtLeast(0.10f)
         val highlightExcess = FloatArray(numPixels)
         val columnSmearAccum = FloatArray(sensorW)
 
@@ -197,58 +204,48 @@ object DigicamIspPipeline {
 
             for (x in 0 until sensorW) {
                 val nx = (x + 0.5f) * invW - 0.5f
-                val rSq = nx * nx + nySq
+                // Normalized r^2 in [0.0, 1.0] from center (0,0) to corners (±0.5, ±0.5)
+                val rSq = 2f * (nx * nx + nySq)
                 val idx = rowOffset + x
 
-                val barrelScale = 1f - barrelK * (rSq * 2f)
-                val sx = ((nx * barrelScale + 0.5f) * sensorW).toInt().coerceIn(0, sensorW - 1)
-                val sy = ((ny * barrelScale + 0.5f) * sensorH).toInt().coerceIn(0, sensorH - 1)
-                val sIdx = sy * sensorW + sx
+                // Consistent barrel distortion across all modes
+                val barrelScale = (1f + barrelK * rSq) * invBarrelNorm
+                val bxNorm = nx * barrelScale
+                val byNorm = ny * barrelScale
 
-                val sxPrev = (sx - 1).coerceAtLeast(0)
-                val sxNext = (sx + 1).coerceAtMost(sensorW - 1)
-                val syPrev = (sy - 1).coerceAtLeast(0)
-                val syNext = (sy + 1).coerceAtMost(sensorH - 1)
-                val edgeGrad = abs(lumaLin[sy * sensorW + sxNext] - lumaLin[sy * sensorW + sxPrev]) +
-                    abs(lumaLin[syNext * sensorW + sx] - lumaLin[syPrev * sensorW + sx])
-                val edgeGate = ((edgeGrad - 0.05f) * 4.5f).coerceIn(0f, 1f)
+                // STEP 6: Lateral CA: R scale = 1 + k_r*r^2, B scale = 1 - k_b*r^2 (k_r > 0, k_b > 0)
+                val rScale = 1f + kR * rSq
+                val bScale = 1f - kB * rSq
 
-                val radialDist = sqrt(rSq * 2f)
-                val caShiftR = nx * radialDist * caFringePx * (0.35f + 0.65f * edgeGate)
-                val caShiftY = ny * radialDist * caFringePx * (0.35f + 0.65f * edgeGate)
+                val gx = (bxNorm + 0.5f) * sensorW - 0.5f
+                val gy = (byNorm + 0.5f) * sensorH - 0.5f
+                val rx = (bxNorm * rScale + 0.5f) * sensorW - 0.5f
+                val ry = (byNorm * rScale + 0.5f) * sensorH - 0.5f
+                val bx = (bxNorm * bScale + 0.5f) * sensorW - 0.5f
+                val by = (byNorm * bScale + 0.5f) * sensorH - 0.5f
 
-                val rx = (sx + caShiftR.roundToInt()).coerceIn(0, sensorW - 1)
-                val ry = (sy + caShiftY.roundToInt()).coerceIn(0, sensorH - 1)
-                val bx = (sx - (caShiftR * 1.15f).roundToInt()).coerceIn(0, sensorW - 1)
-                val by = (sy - (caShiftY * 1.15f).roundToInt()).coerceIn(0, sensorH - 1)
+                var r = sampleBilinear2D(rLin, sensorW, sensorH, rx, ry)
+                var g = sampleBilinear2D(gLin, sensorW, sensorH, gx, gy)
+                var b = sampleBilinear2D(bLin, sensorW, sensorH, bx, by)
 
-                var r = rLin[ry * sensorW + rx]
-                var g = gLin[sIdx]
-                var b = bLin[by * sensorW + bx]
-
-                if (edgeGate > 0.1f && rSq > 0.08f) {
-                    val fringeAmt = edgeGate * (rSq * 2.2f).coerceAtMost(1f) * 0.08f * strength
-                    val chromaDiff = r - g
-                    r = (r + chromaDiff * fringeAmt).coerceAtLeast(0f)
-                    b = (b + chromaDiff * fringeAmt * 1.25f).coerceAtLeast(0f)
-                    g = (g - chromaDiff * fringeAmt * 0.45f).coerceAtLeast(0f)
-                }
-
-                val cornerMask = ((rSq * 2.4f - 0.22f) / 0.78f).coerceIn(0f, 1f) * cornerSoftWeight
+                // Mild corner softness in outer field
+                val cornerMask = ((rSq - 0.30f) / 0.70f).coerceIn(0f, 1f) * cornerSoftWeight
                 if (cornerMask > 0.001f) {
+                    val sIdx = gy.roundToInt().coerceIn(0, sensorH - 1) * sensorW + gx.roundToInt().coerceIn(0, sensorW - 1)
                     r += (rBlurCorner[sIdx] - r) * cornerMask
                     g += (gBlurCorner[sIdx] - g) * cornerMask
                     b += (bBlurCorner[sIdx] - b) * cornerMask
                 }
 
                 if (flashActive) {
-                    val flashFalloff = (rSq * 2.5f).coerceIn(0f, 1f)
+                    val flashFalloff = (rSq * 1.25f).coerceIn(0f, 1f)
                     val flashEnvelope = 1.06f - 0.76f * flashFalloff
                     r *= flashEnvelope * (0.96f + 0.14f * flashFalloff)
                     g *= flashEnvelope
                     b *= flashEnvelope * (1.06f - 0.18f * flashFalloff)
                 } else {
-                    val vig = 1f - vignetteWeight * (rSq * 2.1f).coerceIn(0f, 1f)
+                    // STEP 6: Halved vignette strength
+                    val vig = 1f - vignetteWeight * rSq.coerceIn(0f, 1f)
                     r *= vig
                     g *= vig
                     b *= vig
@@ -259,17 +256,27 @@ object DigicamIspPipeline {
                 bLens[idx] = b
 
                 val yL = (0.2126f * r + 0.7152f * g + 0.0722f * b) * spec.exposureBiasGain
-                if (yL > highlightClipLin) {
-                    val ex = ((yL - highlightClipLin) / (1.05f - highlightClipLin)).coerceIn(0f, 1.5f)
+                lumaLin[idx] = yL
+                if (yL > bloomThreshold) {
+                    val ex = ((yL - bloomThreshold) * invBloomSpan).coerceIn(0f, 1.5f)
                     highlightExcess[idx] = ex
                     columnSmearAccum[x] += ex
                 }
             }
         }
 
-        // Stage 3: CCD Highlight Bloom & Veiling Glare
-        val highlightBloomMap = boxBlurSeparable(highlightExcess, sensorW, sensorH, bloomRadius, blurTmp, lumaLin)
+        // STEP 6: Point-light bloom (blur sigma ~3 px), vertical smear, and dark-side blue-violet fringing (10-20%)
+        val bloomSigmaPx = spec.pointLightBloomSigmaPx.coerceIn(2.0f, 4.0f)
+        val highlightBloomMap = gaussianBlurSeparable(highlightExcess, sensorW, sensorH, bloomSigmaPx, blurTmp)
+        val lumaEdgeBlur = gaussianBlurSeparable(lumaLin, sensorW, sensorH, 2.2f, blurTmp, lumaLin)
         val veilingMean = (highlightExcess.sum() / numPixels.toFloat()).coerceIn(0f, 0.25f) * veilingWeight
+
+        // Smooth column smear horizontally across adjacent columns for natural vertical CCD streak
+        val smoothedColumnSmear = FloatArray(sensorW) { x ->
+            val xm1 = (x - 1).coerceAtLeast(0)
+            val xp1 = (x + 1).coerceAtMost(sensorW - 1)
+            0.25f * columnSmearAccum[xm1] + 0.50f * columnSmearAccum[x] + 0.25f * columnSmearAccum[xp1]
+        }
 
         // STEP 4: Generate 1/2-res Luma Read Noise and 1/4-res Chroma Read Noise (bilinearly upsampled)
         val halfW = (sensorW / 2).coerceAtLeast(2)
@@ -303,6 +310,7 @@ object DigicamIspPipeline {
         val wbB = spec.wbGainB * shotDriftB
         val bloomWeight = (spec.highlightBloomAmount * tuning.bloomAndSmearMultiplier * strength).coerceIn(0f, 0.28f)
         val smearWeight = (spec.verticalSmearStrength * tuning.bloomAndSmearMultiplier * strength / sensorH.toFloat()).coerceIn(0f, 0.20f)
+        val blueVioletFringeWeight = (spec.blueVioletFringeStrength * tuning.chromaticAberrationMultiplier * strength).coerceIn(0f, 0.25f)
 
         // STEP 3: Black clip (0.03-0.05), Pre-clip exposure gain (1.4-1.8x), White clip (0.72-0.82)
         val blackClip = (spec.blackClipLinear * strength).coerceIn(0.0f, 0.055f)
@@ -329,17 +337,36 @@ object DigicamIspPipeline {
 
             for (x in 0 until sensorW) {
                 val idx = rowOffset + x
-                var r = rLens[idx] + veilingMean
-                var g = gLens[idx] + veilingMean
-                var b = bLens[idx] + veilingMean
+                val rBase = rLens[idx]
+                val gBase = gLens[idx]
+                val bBase = bLens[idx]
+                var r = rBase + veilingMean
+                var g = gBase + veilingMean
+                var b = bBase + veilingMean
 
+                // STEP 6: Point-light bloom (sigma ~3 px) + vertical smear
                 val bloomAdd = highlightBloomMap[idx] * bloomWeight
-                val colSmear = (columnSmearAccum[x] * smearWeight).coerceAtMost(0.18f)
+                val colSmear = (smoothedColumnSmear[x] * smearWeight).coerceAtMost(0.18f)
                 if (colSmear > peakSmear) peakSmear = colSmear
                 val totalBleed = bloomAdd + colSmear
                 r += totalBleed
                 g += totalBleed * 0.98f
                 b += totalBleed * 1.04f
+
+                // STEP 6: Blue-violet fringing on the dark side of edges at 10-20% strength
+                val yCurr = (0.2126f * rBase + 0.7152f * gBase + 0.0722f * bBase) * spec.exposureBiasGain
+                val yNeighbor = lumaEdgeBlur[idx]
+                val darkSideEdge = (yNeighbor - yCurr).coerceAtLeast(0f)
+                val darkSideMask = (1f - (yCurr / bloomThreshold).coerceIn(0f, 1f)).pow(2)
+                val bloomDarkSide = highlightBloomMap[idx] * darkSideMask
+                val brightEdgeDarkSide = darkSideEdge * ((yNeighbor - 0.45f) / 0.40f).coerceIn(0f, 1f)
+                val fringeSignal = max(bloomDarkSide, brightEdgeDarkSide * 1.35f)
+                if (fringeSignal > 0.001f) {
+                    val bvFringe = fringeSignal * blueVioletFringeWeight
+                    r += bvFringe * 0.48f
+                    g = (g - bvFringe * 0.22f).coerceAtLeast(0f)
+                    b += bvFringe * 1.00f
+                }
 
                 // STEP 3.1: Black clip 0.03-0.05 first in linear space
                 r = ((r - blackClip).coerceAtLeast(0f)) * invBlackSpan
@@ -457,14 +484,16 @@ object DigicamIspPipeline {
             }
         }
 
-        // Stage 5: Per-Mode Over-Sharpening with Visible Edge Halos at Internal Sensor Size
-        val yBlurUsm = boxBlurSeparable(yAfterNr, sensorW, sensorH, usmRadius, blurTmp, yBlurNr)
-        val usmAmount = (spec.usmCrispness * tuning.edgeHaloUsmMultiplier * strength * 1.40f).coerceIn(0f, 2.0f)
-        val haloCap = (spec.usmHaloLimit * tuning.edgeHaloUsmMultiplier * strength).coerceIn(0.03f, 0.18f)
+        // STEP 5: Luma Unsharp Mask ONLY, radius 1.0-1.5 px at internal resolution,
+        // no broad local-contrast/"clarity" step, halo amount reduced by ~40% in every mode.
+        val usmRadiusPx = spec.usmRadiusPx.coerceIn(1.0f, 1.5f)
+        val yBlurUsm = gaussianBlurSeparable(yAfterNr, sensorW, sensorH, usmRadiusPx, blurTmp, yBlurNr)
+        val usmAmount = (spec.usmCrispness * tuning.edgeHaloUsmMultiplier * strength).coerceIn(0f, 1.2f)
+        val haloCap = (spec.usmHaloLimit * tuning.edgeHaloUsmMultiplier * strength).coerceIn(0f, 0.12f)
 
         for (i in 0 until numPixels) {
             val edgeDelta = yAfterNr[i] - yBlurUsm[i]
-            if (abs(edgeDelta) > 0.012f) {
+            if (abs(edgeDelta) > 0.010f) {
                 val haloOvershoot = (edgeDelta * usmAmount).coerceIn(-haloCap, haloCap)
                 yAfterNr[i] = (yAfterNr[i] + haloOvershoot).coerceIn(0f, 1f)
             }
@@ -623,7 +652,34 @@ object DigicamIspPipeline {
     }
 
     /**
-     * STEP 2: Separable 5-tap Gaussian Low-Pass Filter.
+     * Bilinear 2D sampler for smooth subpixel barrel distortion and 1-2 px lateral CA shifts.
+     */
+    private fun sampleBilinear2D(
+        plane: FloatArray,
+        width: Int,
+        height: Int,
+        fx: Float,
+        fy: Float
+    ): Float {
+        val cx = fx.coerceIn(0f, (width - 1).toFloat())
+        val cy = fy.coerceIn(0f, (height - 1).toFloat())
+        val x0 = cx.toInt().coerceIn(0, width - 1)
+        val y0 = cy.toInt().coerceIn(0, height - 1)
+        val x1 = (x0 + 1).coerceAtMost(width - 1)
+        val y1 = (y0 + 1).coerceAtMost(height - 1)
+        val tx = cx - x0
+        val ty = cy - y0
+
+        val r0 = y0 * width
+        val r1 = y1 * width
+        val top = plane[r0 + x0] + (plane[r0 + x1] - plane[r0 + x0]) * tx
+        val bot = plane[r1 + x0] + (plane[r1 + x1] - plane[r1 + x0]) * tx
+        return top + (bot - top) * ty
+    }
+
+    /**
+     * Separable Gaussian Filter supporting OLPF (0.6..1.5 px), Luma USM (1.0..1.5 px),
+     * and Point-Light Bloom (sigma ~3.0 px).
      */
     private fun gaussianBlurSeparable(
         src: FloatArray,
@@ -634,39 +690,49 @@ object DigicamIspPipeline {
         dstBuf: FloatArray? = null
     ): FloatArray {
         val dst = dstBuf ?: FloatArray(width * height)
-        val s = sigma.coerceIn(0.4f, 2.5f)
+        val s = sigma.coerceIn(0.4f, 4.0f)
+        val radius = kotlin.math.ceil(2.5f * s).toInt().coerceIn(2, 9)
         val twoSigmaSq = 2f * s * s
-        val w0 = 1f
-        val w1 = exp(-1f / twoSigmaSq)
-        val w2 = exp(-4f / twoSigmaSq)
-        val norm = 1f / (w0 + 2f * (w1 + w2))
-        val k0 = w0 * norm
-        val k1 = w1 * norm
-        val k2 = w2 * norm
+        val weights = FloatArray(radius + 1)
+        var sumW = 1f
+        weights[0] = 1f
+        for (k in 1..radius) {
+            val w = exp(-(k * k).toFloat() / twoSigmaSq)
+            weights[k] = w
+            sumW += 2f * w
+        }
+        val norm = 1f / sumW
+        for (k in 0..radius) {
+            weights[k] *= norm
+        }
+
+        val maxW = width - 1
+        val maxH = height - 1
+        val w0 = weights[0]
 
         for (y in 0 until height) {
             val row = y * width
             for (x in 0 until width) {
-                val xm2 = (x - 2).coerceAtLeast(0)
-                val xm1 = (x - 1).coerceAtLeast(0)
-                val xp1 = (x + 1).coerceAtMost(width - 1)
-                val xp2 = (x + 2).coerceAtMost(width - 1)
-                tmp[row + x] = src[row + x] * k0 +
-                    (src[row + xm1] + src[row + xp1]) * k1 +
-                    (src[row + xm2] + src[row + xp2]) * k2
+                var acc = src[row + x] * w0
+                for (k in 1..radius) {
+                    val xm = (x - k).coerceAtLeast(0)
+                    val xp = (x + k).coerceAtMost(maxW)
+                    acc += (src[row + xm] + src[row + xp]) * weights[k]
+                }
+                tmp[row + x] = acc
             }
         }
 
         for (y in 0 until height) {
-            val ym2 = (y - 2).coerceAtLeast(0) * width
-            val ym1 = (y - 1).coerceAtLeast(0) * width
             val y0 = y * width
-            val yp1 = (y + 1).coerceAtMost(height - 1) * width
-            val yp2 = (y + 2).coerceAtMost(height - 1) * width
             for (x in 0 until width) {
-                dst[y0 + x] = tmp[y0 + x] * k0 +
-                    (tmp[ym1 + x] + tmp[yp1 + x]) * k1 +
-                    (tmp[ym2 + x] + tmp[yp2 + x]) * k2
+                var acc = tmp[y0 + x] * w0
+                for (k in 1..radius) {
+                    val ym = (y - k).coerceAtLeast(0) * width
+                    val yp = (y + k).coerceAtMost(maxH) * width
+                    acc += (tmp[ym + x] + tmp[yp + x]) * weights[k]
+                }
+                dst[y0 + x] = acc
             }
         }
         return dst
