@@ -20,6 +20,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBars
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CameraAlt
 import androidx.compose.material.icons.outlined.PhotoFilter
@@ -37,7 +39,8 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
-import androidx.compose.material3.ToggleButton
+import androidx.compose.material3.FilledTonalToggleButton
+import androidx.compose.material3.FilledTonalToggleButtonDefaults
 import androidx.compose.material3.ToggleButtonShapes
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -110,22 +113,22 @@ fun ChronoCCDAppRoot(
         val systemBarsInsets = WindowInsets.systemBars.asPaddingValues()
 
         Scaffold(
-             containerColor = Color.Black,
+            containerColor = colorScheme.surface,
             snackbarHost = { SnackbarHost(snackbarHostState) },
             bottomBar = {
                 Box(
                     contentAlignment = Alignment.Center,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(Color.Black)
+                        .background(colorScheme.surface)
                 ) {
                     val navBarShape = FloatingToolbarDefaults.ContainerShape
                     HorizontalFloatingToolbar(
                         expanded = true,
                         shape = navBarShape,
-                        colors = FloatingToolbarDefaults.vibrantFloatingToolbarColors(
+                        colors = FloatingToolbarDefaults.standardFloatingToolbarColors(
                             toolbarContainerColor = colorScheme.surfaceContainerHigh,
-                            toolbarContentColor = colorScheme.onSurface
+                            toolbarContentColor = colorScheme.onSurfaceVariant
                         ),
                         modifier = Modifier
                             .padding(
@@ -135,17 +138,24 @@ fun ChronoCCDAppRoot(
                             .zIndex(1f)
                     ) {
                         val buttonShapes = ToggleButtonShapes(
-                            shape = navBarShape,
-                            pressedShape = navBarShape,
-                            checkedShape = navBarShape
+                            shape = CircleShape,
+                            pressedShape = RoundedCornerShape(18.dp),
+                            checkedShape = CircleShape
+                        )
+                        val buttonColors = FilledTonalToggleButtonDefaults.colors(
+                            containerColor = Color.Transparent,
+                            contentColor = colorScheme.onSurfaceVariant,
+                            checkedContainerColor = colorScheme.secondaryContainer,
+                            checkedContentColor = colorScheme.onSecondaryContainer
                         )
                         navItems.forEach { item ->
                             val selected = (uiState.currentTab == item.tab) ||
                                 (item.tab == AppTab.DARKROOM && uiState.currentTab != AppTab.CAMERA)
-                            ToggleButton(
+                            FilledTonalToggleButton(
                                 checked = selected,
                                 onCheckedChange = { viewModel.selectTab(item.tab) },
                                 shapes = buttonShapes,
+                                colors = buttonColors,
                                 modifier = Modifier.height(48.dp)
                             ) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -178,7 +188,7 @@ fun ChronoCCDAppRoot(
             },
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color.Black)
+                .background(colorScheme.surface)
         ) { contentPadding ->
             val currentIndex = NostalgicDigicamCatalog.indexOfFirst {
                 it.id == uiState.selectedPersona.id
@@ -196,7 +206,7 @@ fun ChronoCCDAppRoot(
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.Black)
+                    .background(colorScheme.surface)
             ) {
                 AnimatedContent(
                     targetState = if (uiState.currentTab == AppTab.CAMERA) AppTab.CAMERA else AppTab.DARKROOM,
@@ -225,6 +235,7 @@ fun ChronoCCDAppRoot(
                             onCapturePhoto = { bmp, note, linearTonemap ->
                                 viewModel.captureFromSimulatedSceneOrBitmap(bmp, note, linearTonemap)
                             },
+                            onCaptureError = viewModel::showBannerMessage,
                             onPickGalleryUri = viewModel::loadImageFromUri,
                             onOpenEditor = { viewModel.selectTab(AppTab.DARKROOM) },
                             onToggleNativeSizeExport = viewModel::toggleExportNativeInternalSize,

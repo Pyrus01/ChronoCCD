@@ -165,13 +165,15 @@ object DigicamAgslShader {
             float cornerMask = clamp((rSq - 0.30) / 0.70, 0.0, 1.0) * cornerSoftness;
             colLin = mix(colLin, meanLin, cornerMask);
 
-            // STEP 6: Halved Vignette vs Flash Hotspot
+            // STEP 6: Halved Vignette vs Softened Natural Xenon Flash
             if (flashActive > 0.5) {
-                float flashFalloff = clamp(rSq * 1.25, 0.0, 1.0);
-                float env = 1.06 - 0.76 * flashFalloff;
-                colLin.r *= env * (0.96 + 0.14 * flashFalloff);
-                colLin.g *= env;
-                colLin.b *= env * (1.06 - 0.18 * flashFalloff);
+                float flashFalloff = clamp(rSq * 0.85, 0.0, 1.0);
+                float env = 1.04 - 0.28 * flashFalloff;
+                float3 flashTint = float3(0.98 + 0.05 * flashFalloff, 1.0, 1.03 - 0.07 * flashFalloff);
+                float3 flashScale = env * flashTint;
+                colLin *= flashScale;
+                meanLin *= flashScale;
+                bloomMeanLin *= flashScale;
             } else {
                 float vig = 1.0 - vignetteWeight * clamp(rSq, 0.0, 1.0);
                 colLin *= vig;
@@ -200,11 +202,10 @@ object DigicamAgslShader {
             colLin = max(float3(0.0), colLin - float3(blackClip)) * invBlackSpan;
             meanLin = max(float3(0.0), meanLin - float3(blackClip)) * invBlackSpan;
 
-            // STEP 3.2: Pre-clip exposure gain 1.4-1.8x (per mode)
-            if (flashActive < 0.5) {
-                colLin *= exposureBias;
-                meanLin *= exposureBias;
-            }
+            // STEP 3.2: Pre-clip exposure gain 1.4-1.8x (moderated when Xenon flash is enabled)
+            float effExpGain = (flashActive > 0.5) ? mix(1.0, exposureBias, 0.55) : exposureBias;
+            colLin *= effExpGain;
+            meanLin *= effExpGain;
 
             // STEP 4.1: Shot noise ~ sqrt(luma) before the tone curve
             float linY = max(0.0, dot(colLin, float3(0.2126, 0.7152, 0.0722)));
@@ -316,20 +317,28 @@ object DigicamAgslShader {
                 shader.setFloatUniform("wbGains", spec.wbGainR, spec.wbGainG, spec.wbGainB)
                 shader.setFloatUniform("satBoost", spec.saturationBoost)
                 val effShadow = if (tuning.xenonFlashEnabled) {
-                    (spec.shadowRollOff + 0.10f).coerceAtMost(0.48f)
+                    (spec.shadowRollOff + 0.04f).coerceAtMost(0.45f)
                 } else {
                     spec.shadowRollOff
                 }
                 val effShoulder = if (tuning.xenonFlashEnabled) {
-                    (spec.highlightShoulder * 0.95f).coerceAtLeast(0.68f)
+                    (spec.highlightShoulder * 0.97f).coerceAtLeast(0.70f)
                 } else {
                     spec.highlightShoulder
+                }
+                val effContrast = if (tuning.xenonFlashEnabled) {
+                    (spec.toneContrast + 0.03f).coerceAtMost(0.52f)
+                } else {
+                    spec.toneContrast
                 }
                 shader.setFloatUniform("shadowRollOff", effShadow)
                 shader.setFloatUniform("highlightShoulder", effShoulder)
                 shader.setFloatUniform("invGamma", 1f / spec.midtoneGamma.coerceIn(0.75f, 1.35f))
-                shader.setFloatUniform("toneContrast", spec.toneContrast)
-                shader.setFloatUniform("deClarity", spec.deClaritySoftness)
+                shader.setFloatUniform("toneContrast", effContrast)
+                shader.setFloatUniform(
+                    "deClarity",
+                    if (tuning.useFullSensorResolution) spec.deClaritySoftness * 0.25f else spec.deClaritySoftness
+                )
                 shader.setFloatUniform("usmRadiusPx", spec.usmRadiusPx)
                 shader.setFloatUniform("usmCrisp", spec.usmCrispness * tuning.edgeHaloUsmMultiplier)
                 shader.setFloatUniform("usmHaloCap", spec.usmHaloLimit * tuning.edgeHaloUsmMultiplier)
@@ -338,7 +347,10 @@ object DigicamAgslShader {
                 shader.setFloatUniform("blueVioletFringe", spec.blueVioletFringeStrength * tuning.chromaticAberrationMultiplier)
                 shader.setFloatUniform("fineGrain", spec.fineLumaGrain * tuning.ccdNoiseMultiplier)
                 shader.setFloatUniform("chromaBlotch", spec.shadowChromaSpeckle * tuning.ccdNoiseMultiplier)
-                shader.setFloatUniform("cornerSoftness", spec.cornerSoftness)
+                shader.setFloatUniform(
+                    "cornerSoftness",
+                    if (tuning.useFullSensorResolution) spec.cornerSoftness * 0.35f else spec.cornerSoftness
+                )
                 shader.setFloatUniform("caKr", spec.caKr * tuning.chromaticAberrationMultiplier)
                 shader.setFloatUniform("caKb", spec.caKb * tuning.chromaticAberrationMultiplier)
                 shader.setFloatUniform("barrelK", spec.barrelDistortion)
@@ -366,9 +378,9 @@ object DigicamAgslShader {
                 val offset = (-spec.shadowRollOff * 52f)
                 val cm = ColorMatrix(
                     floatArrayOf(
-                        m[0] * spec.wbGainR * c, m[1] * c, m[2] * c, 0f, offset,
-                        m[3] * c, m[4] * spec.wbGainG * c, m[5] * c, 0f, offset,
-                        m[6] * c, m[7] * c, m[8] * spec.wbGainB * c, 0f, offset,
+                        m[0] * spec.wbGainR * c, m[1] * spec.wbGainR * c, m[2] * spec.wbGainR * c, 0f, offset,
+                        m[3] * spec.wbGainG * c, m[4] * spec.wbGainG * c, m[5] * spec.wbGainG * c, 0f, offset,
+                        m[6] * spec.wbGainB * c, m[7] * spec.wbGainB * c, m[8] * spec.wbGainB * c, 0f, offset,
                         0f, 0f, 0f, 1f, 0f
                     )
                 )

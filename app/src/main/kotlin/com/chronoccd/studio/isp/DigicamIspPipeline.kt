@@ -3,7 +3,6 @@ package com.chronoccd.studio.isp
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
-import android.graphics.Paint
 import com.chronoccd.studio.data.DigicamPersona
 import com.chronoccd.studio.data.IspUserTuning
 import com.chronoccd.studio.data.TimestampConfig
@@ -39,21 +38,23 @@ data class IspProcessedResult(
 /**
  * Hardware-Ordered 2000s Compact Digital Camera (CCD + ASIC ISP) Pipeline.
  *
- * Implements the exact per-mode resolution & artifact architecture:
+ * Implements the exact per-mode resolution & artifact architecture with a strict 6-plane
+ * peak Java heap footprint:
  * 1. Capture high-res still -> Optical Low-Pass Filter (OLPF) -> Downsample to per-mode internal size
- *    (VGA 640x480, 0.8MP 960x720, 1.3MP 1280x960, 2MP 1600x1200, or 4MP 2048x1536).
+ *    (VGA 640x480, 0.8MP 960x720, 1.3MP 1280x960, 2MP 1600x1200, or 4MP 2048x1536),
+ *    or preserve crisp full sensor resolution (capped to safe heap limits).
  * 2. Run the ENTIRE chain at that internal size:
  *    - Linear space conversion
- *    - Compact lens physics (barrel distortion, mushy corners, edge-gated purple/green CA, mild vignette)
+ *    - Compact lens physics (barrel distortion, inline 5-tap corner softness, lateral CA, vignette / Xenon flash)
  *    - Light-starved 8-10 stop CCD dynamic range, early highlight clip, bloom & vertical smear
- *    - Signal-dependent linear noise (20%) + AWB + per-camera 3x3 matrix + channel crosstalk
- *    - Punchy SOOC S-curve tone mapping
- *    - Smeary in-camera noise reduction (low-contrast watercolor smoothing)
- *    - Per-mode Unsharp Mask sharpening with visible edge halos
- *    - 4:2:0 chroma subsampling + crisp post-NR digital sensor grain
- *    - Classic 7-segment quartz date stamp (imprinted at internal sensor size!)
- *    - Actual JPEG encode/decode round-trip at per-mode quality (58..86) at internal sensor size!
- * 3. Upscale to 1080p (1440x1080 / 1080x1440) with bilinear filtering ONLY at the very end.
+ *    - Signal-dependent shot noise + AWB + per-camera 3x3 matrix + channel crosstalk
+ *    - Punchy SOOC S-curve tone mapping + constant read noise floor
+ *    - Smeary in-camera noise reduction
+ *    - Per-mode Luma Unsharp Mask sharpening with capped edge halos
+ *    - 4:2:0 chroma subsampling streamed 2 rows at a time
+ *    - Classic 7-segment quartz date stamp imprinted at internal sensor size
+ *    - Actual JPEG encode/decode round-trip at per-mode quality (58..86) in retro modes
+ * 3. Upscale to 1080p with Lanczos-3 filtering ONLY on final export.
  */
 object DigicamIspPipeline {
 
@@ -70,7 +71,34 @@ object DigicamIspPipeline {
         i / 255f
     }
 
+    private val LINEAR_TO_SRGB_BYTE = IntArray(256) { i ->
+        (linearToSrgb(i / 255f) * 255f + 0.5f).toInt().coerceIn(0, 255)
+    }
+
     private val ispLock = Any()
+
+    /**
+     * Converts a linear-tonemap bitmap into display-ready sRGB row-by-row with minimal heap usage.
+     */
+    fun encodeLinearBitmapToSrgb(source: Bitmap): Bitmap {
+        val w = source.width.coerceAtLeast(1)
+        val h = source.height.coerceAtLeast(1)
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val row = IntArray(w)
+        for (y in 0 until h) {
+            source.getPixels(row, 0, w, 0, y, w, 1)
+            for (x in 0 until w) {
+                val c = row[x]
+                val a = c and 0xFF000000.toInt()
+                val r = LINEAR_TO_SRGB_BYTE[(c ushr 16) and 0xFF]
+                val g = LINEAR_TO_SRGB_BYTE[(c ushr 8) and 0xFF]
+                val b = LINEAR_TO_SRGB_BYTE[c and 0xFF]
+                row[x] = a or (r shl 16) or (g shl 8) or b
+            }
+            out.setPixels(row, 0, w, 0, y, w, 1)
+        }
+        return out
+    }
 
     fun processBitmap(
         source: Bitmap,
@@ -84,16 +112,31 @@ object DigicamIspPipeline {
         val spec = persona.ispSpec
         val strength = tuning.intensity.coerceIn(0f, 1.25f)
 
-        val srcW = source.width.coerceAtLeast(1)
-        val srcH = source.height.coerceAtLeast(1)
+        val srcW = source.width.coerceAtLeast(2)
+        val srcH = source.height.coerceAtLeast(2)
 
         // Step 1: Determine Internal Resolution:
-        // Either full sensor resolution or each color mode's predetermined internal resolution (VGA 640, 0.8MP 960, 1.3MP 1280, 2MP 1600, 4MP 2048)
+        // Either crisp full sensor resolution (heap-guarded) or each mode's predetermined resolution
         val sensorW: Int
         val sensorH: Int
         if (tuning.useFullSensorResolution) {
-            sensorW = (srcW / 2) * 2
-            sensorH = (srcH / 2) * 2
+            val maxLongEdge = if (isPreviewMode) 2560 else 3840
+            var targetScale = if (max(srcW, srcH) > maxLongEdge) {
+                maxLongEdge.toFloat() / max(srcW, srcH).toFloat()
+            } else {
+                1f
+            }
+            if (!isPreviewMode) {
+                val maxHeapBytes = Runtime.getRuntime().maxMemory().toDouble()
+                val maxSafePixels = ((maxHeapBytes * 0.45) / (6.5 * 4.0)).toLong().coerceAtLeast(1_500_000L)
+                val scaledPixels = (srcW * targetScale).toDouble() * (srcH * targetScale).toDouble()
+                if (scaledPixels > maxSafePixels.toDouble()) {
+                    val memScale = sqrt(maxSafePixels.toDouble() / scaledPixels).toFloat()
+                    targetScale *= memScale
+                }
+            }
+            sensorW = (((srcW * targetScale).roundToInt().coerceAtLeast(2)) / 2) * 2
+            sensorH = (((srcH * targetScale).roundToInt().coerceAtLeast(2)) / 2) * 2
         } else {
             val internalLongEdge = (spec.sensorLongEdgePx * tuning.sensorPitchMultiplier)
                 .roundToInt()
@@ -103,7 +146,7 @@ object DigicamIspPipeline {
             sensorH = (((srcH * internalScale).roundToInt().coerceAtLeast(64)) / 2) * 2
         }
 
-        // Multi-step pre-downsample + Optical Low-Pass Filter (OLPF) so high-res phone detail is low-passed before hitting the CCD grid
+        // Multi-step pre-downsample so high-res phone detail is cleanly filtered before hitting the CCD grid
         val sensorBitmap = if (tuning.useFullSensorResolution) {
             if (source.width != sensorW || source.height != sensorH) {
                 Bitmap.createScaledBitmap(source, sensorW, sensorH, true)
@@ -126,72 +169,77 @@ object DigicamIspPipeline {
         }
 
         val numPixels = sensorW * sensorH
-        val inPixels = IntArray(numPixels)
-        sensorBitmap.getPixels(inPixels, 0, sensorW, 0, 0, sensorW, sensorH)
+
+        // Strict 6-plane peak Java heap budget: (rLin, gLin, bLin, rLens, gLens, bLens)
+        val rLin = FloatArray(numPixels)
+        val gLin = FloatArray(numPixels)
+        val bLin = FloatArray(numPixels)
+        val rLens = FloatArray(numPixels)
+        val gLens = FloatArray(numPixels)
+        val bLens = FloatArray(numPixels)
+
+        // Stream input row-by-row into linear light (sRGB inverse unless a linear tonemap is active)
+        val inputToLinearLut = if (linearTonemapActive) LINEAR_IDENTITY else SRGB_TO_LINEAR
+        val rowPixels = IntArray(sensorW)
+        var totalLumaSum = 0.0
+        val sigIdxA = numPixels / 2
+        val sigIdxB = numPixels / 3
+        var sigPixelA = 0
+        var sigPixelB = 0
+
+        for (y in 0 until sensorH) {
+            sensorBitmap.getPixels(rowPixels, 0, sensorW, 0, y, sensorW, 1)
+            val rowOffset = y * sensorW
+            for (x in 0 until sensorW) {
+                val c = rowPixels[x]
+                val idx = rowOffset + x
+                if (idx == sigIdxA) sigPixelA = c
+                if (idx == sigIdxB) sigPixelB = c
+                val rl = inputToLinearLut[(c ushr 16) and 0xFF]
+                val gl = inputToLinearLut[(c ushr 8) and 0xFF]
+                val bl = inputToLinearLut[c and 0xFF]
+                rLin[idx] = rl
+                gLin[idx] = gl
+                bLin[idx] = bl
+                totalLumaSum += (0.2126f * rl + 0.7152f * gl + 0.0722f * bl)
+            }
+        }
         if (sensorBitmap !== source) {
             sensorBitmap.recycle()
         }
 
-        // Decode input to linear light (sRGB inverse unless a linear tonemap is active)
-        val inputToLinearLut = if (linearTonemapActive) LINEAR_IDENTITY else SRGB_TO_LINEAR
-        val rLin = FloatArray(numPixels)
-        val gLin = FloatArray(numPixels)
-        val bLin = FloatArray(numPixels)
-        val blurTmp = FloatArray(numPixels)
-        var totalLumaSum = 0.0
-
-        for (i in 0 until numPixels) {
-            val c = inPixels[i]
-            val rl = inputToLinearLut[(c ushr 16) and 0xFF]
-            val gl = inputToLinearLut[(c ushr 8) and 0xFF]
-            val bl = inputToLinearLut[c and 0xFF]
-            rLin[i] = rl
-            gLin[i] = gl
-            bLin[i] = bl
-            totalLumaSum += (0.2126f * rl + 0.7152f * gl + 0.0722f * bl)
-        }
-
-        // STEP 2: Gaussian Low-Pass Filter (OLPF) in linear space
-        val olpfSigma = (0.75f + spec.olpfLowPassStrength * strength * 0.85f).coerceIn(0.60f, 1.55f)
-        val rOlpfBlur = gaussianBlurSeparable(rLin, sensorW, sensorH, olpfSigma, blurTmp)
-        val gOlpfBlur = gaussianBlurSeparable(gLin, sensorW, sensorH, olpfSigma, blurTmp)
-        val bOlpfBlur = gaussianBlurSeparable(bLin, sensorW, sensorH, olpfSigma, blurTmp)
-
-        val lumaLin = FloatArray(numPixels)
-        for (i in 0 until numPixels) {
-            val rl = rOlpfBlur[i]
-            val gl = gOlpfBlur[i]
-            val bl = bOlpfBlur[i]
-            rLin[i] = rl
-            gLin[i] = gl
-            bLin[i] = bl
-            lumaLin[i] = 0.2126f * rl + 0.7152f * gl + 0.0722f * bl
+        // STEP 2: Gaussian Low-Pass Filter (OLPF) in linear space (skipped in Full Sensor Resolution mode)
+        // Reuse rLens as temporary scratch buffer so peak heap remains 6 planes.
+        if (!tuning.useFullSensorResolution) {
+            val olpfSigma = (0.75f + spec.olpfLowPassStrength * strength * 0.85f).coerceIn(0.60f, 1.55f)
+            gaussianBlurSeparable(rLin, sensorW, sensorH, olpfSigma, rLens, rLin)
+            gaussianBlurSeparable(gLin, sensorW, sensorH, olpfSigma, rLens, gLin)
+            gaussianBlurSeparable(bLin, sensorW, sensorH, olpfSigma, rLens, bLin)
         }
 
         val meanSceneLuma = (totalLumaSum / numPixels.toDouble()).toFloat().coerceIn(0.02f, 0.95f)
         val lowLightIsoFactor = ((0.36f - meanSceneLuma) / 0.30f).coerceIn(0f, 1f)
         val effectiveIsoNoiseScale = 0.80f + 0.60f * lowLightIsoFactor
 
-        val imageSignature = ((inPixels[numPixels / 2] xor inPixels[numPixels / 3]) and 0x7FFFFFFF)
+        val imageSignature = ((sigPixelA xor sigPixelB) and 0x7FFFFFFF)
         val shotDriftR = 1f + ((imageSignature % 19) - 9) * 0.0018f
         val shotDriftB = 1f - ((imageSignature % 17) - 8) * 0.0018f
         val shotExposureDrift = 1f + ((imageSignature % 13) - 6) * 0.003f
 
         // Scale spatial radii proportionally to internal sensor size
         val resScale = (max(sensorW, sensorH) / 1280f).coerceIn(0.5f, if (tuning.useFullSensorResolution) 3.5f else 1.6f)
-        val cornerSigma = (1.6f * resScale).coerceIn(1.2f, 2.4f)
-        val nrRadius = (2f * resScale).roundToInt().coerceIn(1, 3)
+        val cornerSigma = if (tuning.useFullSensorResolution) 1.2f else (1.6f * resScale).coerceIn(1.2f, 2.4f)
+        val cornerSoftScale = if (tuning.useFullSensorResolution) 0.35f else 1.0f
+        val nrRadius = if (tuning.useFullSensorResolution) 1 else (2f * resScale).roundToInt().coerceIn(1, 3)
+        val nrSmearScale = if (tuning.useFullSensorResolution) 0.22f else 1.0f
 
         // STEP 6: Lens Effects in Linear Space at Internal Size
-        // - Mild corner softness in all modes
+        // - Inline 5-tap cross corner softness (zero extra blur arrays)
         // - Consistent barrel distortion in all modes
-        // - Lateral CA: R scale = 1 + k_r*r^2, B scale = 1 - k_b*r^2 (k_r > 0, k_b > 0, max shift 1-2 px at corners)
-        // - Halved vignette strength
-        val rBlurCorner = gaussianBlurSeparable(rLin, sensorW, sensorH, cornerSigma, blurTmp, rOlpfBlur)
-        val gBlurCorner = gaussianBlurSeparable(gLin, sensorW, sensorH, cornerSigma, blurTmp, gOlpfBlur)
-        val bBlurCorner = gaussianBlurSeparable(bLin, sensorW, sensorH, cornerSigma, blurTmp, bOlpfBlur)
-
-        val cornerSoftWeight = (spec.cornerSoftness * strength).coerceIn(0f, 0.45f)
+        // - Lateral CA: R scale = 1 + k_r*r^2, B scale = 1 - k_b*r^2
+        // - Halved vignette strength or softened natural Xenon flash
+        val cornerSoftWeight = (spec.cornerSoftness * cornerSoftScale * strength).coerceIn(0f, 0.45f)
+        val cornerStepPx = cornerSigma.roundToInt().coerceAtLeast(1)
         val caMult = (tuning.chromaticAberrationMultiplier * strength).coerceIn(0f, 2.0f)
         val kR = (spec.caKr * caMult).coerceAtLeast(0f)
         val kB = (spec.caKb * caMult).coerceAtLeast(0f)
@@ -200,18 +248,10 @@ object DigicamIspPipeline {
         val vignetteWeight = (spec.lensVignette * strength).coerceIn(0f, 0.12f)
         val veilingWeight = (spec.veilingFlare * strength).coerceIn(0f, 0.16f)
 
-        val rLens = FloatArray(numPixels)
-        val gLens = FloatArray(numPixels)
-        val bLens = FloatArray(numPixels)
-
-        // STEP 6: Point-light bloom threshold luma > 0.82
-        val bloomThreshold = spec.pointLightBloomThreshold.coerceIn(0.75f, 0.90f)
-        val invBloomSpan = 1f / (1f - bloomThreshold).coerceAtLeast(0.10f)
-        val highlightExcess = FloatArray(numPixels)
-        val columnSmearAccum = FloatArray(sensorW)
-
         val invW = 1f / sensorW.toFloat()
         val invH = 1f / sensorH.toFloat()
+        val maxX = sensorW - 1
+        val maxY = sensorH - 1
         val flashActive = tuning.xenonFlashEnabled
 
         for (y in 0 until sensorH) {
@@ -245,21 +285,36 @@ object DigicamIspPipeline {
                 var g = sampleBilinear2D(gLin, sensorW, sensorH, gx, gy)
                 var b = sampleBilinear2D(bLin, sensorW, sensorH, bx, by)
 
-                // Mild corner softness in outer field
+                // Mild corner softness computed inline via 5-tap cross filter (zero corner blur planes)
                 val cornerMask = ((rSq - 0.30f) / 0.70f).coerceIn(0f, 1f) * cornerSoftWeight
                 if (cornerMask > 0.001f) {
-                    val sIdx = gy.roundToInt().coerceIn(0, sensorH - 1) * sensorW + gx.roundToInt().coerceIn(0, sensorW - 1)
-                    r += (rBlurCorner[sIdx] - r) * cornerMask
-                    g += (gBlurCorner[sIdx] - g) * cornerMask
-                    b += (bBlurCorner[sIdx] - b) * cornerMask
+                    val cx = gx.roundToInt().coerceIn(0, maxX)
+                    val cy = gy.roundToInt().coerceIn(0, maxY)
+                    val xm = (cx - cornerStepPx).coerceAtLeast(0)
+                    val xp = (cx + cornerStepPx).coerceAtMost(maxX)
+                    val ym = (cy - cornerStepPx).coerceAtLeast(0) * sensorW
+                    val yp = (cy + cornerStepPx).coerceAtMost(maxY) * sensorW
+                    val yc = cy * sensorW
+                    val iC = yc + cx
+                    val iL = yc + xm
+                    val iR = yc + xp
+                    val iU = ym + cx
+                    val iD = yp + cx
+
+                    val rCornerBlur = 0.20f * (rLin[iC] + rLin[iL] + rLin[iR] + rLin[iU] + rLin[iD])
+                    val gCornerBlur = 0.20f * (gLin[iC] + gLin[iL] + gLin[iR] + gLin[iU] + gLin[iD])
+                    val bCornerBlur = 0.20f * (bLin[iC] + bLin[iL] + bLin[iR] + bLin[iU] + bLin[iD])
+                    r += (rCornerBlur - r) * cornerMask
+                    g += (gCornerBlur - g) * cornerMask
+                    b += (bCornerBlur - b) * cornerMask
                 }
 
                 if (flashActive) {
-                    val flashFalloff = (rSq * 1.25f).coerceIn(0f, 1f)
-                    val flashEnvelope = 1.06f - 0.76f * flashFalloff
-                    r *= flashEnvelope * (0.96f + 0.14f * flashFalloff)
+                    val flashFalloff = (rSq * 0.85f).coerceIn(0f, 1f)
+                    val flashEnvelope = 1.04f - 0.28f * flashFalloff
+                    r *= flashEnvelope * (0.98f + 0.05f * flashFalloff)
                     g *= flashEnvelope
-                    b *= flashEnvelope * (1.06f - 0.18f * flashFalloff)
+                    b *= flashEnvelope * (1.03f - 0.07f * flashFalloff)
                 } else {
                     // STEP 6: Halved vignette strength
                     val vig = 1f - vignetteWeight * rSq.coerceIn(0f, 1f)
@@ -271,38 +326,56 @@ object DigicamIspPipeline {
                 rLens[idx] = r
                 gLens[idx] = g
                 bLens[idx] = b
+            }
+        }
 
-                val yL = (0.2126f * r + 0.7152f * g + 0.0722f * b) * spec.exposureBiasGain
+        // Reuse rLin / gLin / bLin for lumaLin / highlightExcess / blurTmp (strict 6-plane ceiling)
+        val lumaLin = rLin
+        val highlightExcess = gLin
+        val blurTmp = bLin
+
+        // STEP 6: Point-light bloom threshold luma > 0.82
+        val bloomThreshold = spec.pointLightBloomThreshold.coerceIn(0.75f, 0.90f)
+        val invBloomSpan = 1f / (1f - bloomThreshold).coerceAtLeast(0.10f)
+        val columnSmearAccum = FloatArray(sensorW)
+        var highlightExcessSum = 0.0
+
+        for (y in 0 until sensorH) {
+            val rowOffset = y * sensorW
+            for (x in 0 until sensorW) {
+                val idx = rowOffset + x
+                val yL = (0.2126f * rLens[idx] + 0.7152f * gLens[idx] + 0.0722f * bLens[idx]) * spec.exposureBiasGain
                 lumaLin[idx] = yL
                 if (yL > bloomThreshold) {
                     val ex = ((yL - bloomThreshold) * invBloomSpan).coerceIn(0f, 1.5f)
                     highlightExcess[idx] = ex
                     columnSmearAccum[x] += ex
+                    highlightExcessSum += ex
+                } else {
+                    highlightExcess[idx] = 0f
                 }
             }
         }
 
-        // STEP 6: Point-light bloom (blur sigma ~3 px), vertical smear, and dark-side blue-violet fringing (10-20%)
+        // STEP 6: Point-light bloom (blur sigma ~3 px), vertical smear, and dark-side blue-violet fringing
+        val veilingMean = ((highlightExcessSum / numPixels.toDouble()).toFloat()).coerceIn(0f, 0.25f) * veilingWeight
         val bloomSigmaPx = spec.pointLightBloomSigmaPx.coerceIn(2.0f, 4.0f)
-        val highlightBloomMap = gaussianBlurSeparable(highlightExcess, sensorW, sensorH, bloomSigmaPx, blurTmp)
+        val highlightBloomMap = gaussianBlurSeparable(highlightExcess, sensorW, sensorH, bloomSigmaPx, blurTmp, highlightExcess)
         val lumaEdgeBlur = gaussianBlurSeparable(lumaLin, sensorW, sensorH, 2.2f, blurTmp, lumaLin)
-        val veilingMean = (highlightExcess.sum() / numPixels.toFloat()).coerceIn(0f, 0.25f) * veilingWeight
 
         // Smooth column smear horizontally across adjacent columns for natural vertical CCD streak
         val smoothedColumnSmear = FloatArray(sensorW) { x ->
             val xm1 = (x - 1).coerceAtLeast(0)
-            val xp1 = (x + 1).coerceAtMost(sensorW - 1)
+            val xp1 = (x + 1).coerceAtMost(maxX)
             0.25f * columnSmearAccum[xm1] + 0.50f * columnSmearAccum[x] + 0.25f * columnSmearAccum[xp1]
         }
 
-        // STEP 4: Generate 1/2-res Luma Read Noise and 1/4-res Chroma Read Noise (bilinearly upsampled)
+        // STEP 4: Generate compact 1/2-res Luma & 1/4-res Chroma noise grids (sampled bilinearly inline)
         val halfW = (sensorW / 2).coerceAtLeast(2)
         val halfH = (sensorH / 2).coerceAtLeast(2)
         val halfLumaGrid = FloatArray(halfW * halfH) { i ->
             pseudoGaussian(i * 43 + imageSignature + 503)
         }
-        val upsampledHalfLuma = upsampleBilinear(halfLumaGrid, halfW, halfH, sensorW, sensorH, blurTmp)
-
         val quarterW = (sensorW / 4).coerceAtLeast(2)
         val quarterH = (sensorH / 4).coerceAtLeast(2)
         val quarterCbGrid = FloatArray(quarterW * quarterH) { i ->
@@ -311,14 +384,18 @@ object DigicamIspPipeline {
         val quarterCrGrid = FloatArray(quarterW * quarterH) { i ->
             pseudoGaussian(i * 73 + imageSignature + 89)
         }
-        val blotchyCbField = upsampleBilinear(quarterCbGrid, quarterW, quarterH, sensorW, sensorH, rBlurCorner)
-        val blotchyCrField = upsampleBilinear(quarterCrGrid, quarterW, quarterH, sensorW, sensorH, gBlurCorner)
+        val invSensorWm1 = 1f / (sensorW - 1).coerceAtLeast(1).toFloat()
+        val invSensorHm1 = 1f / (sensorH - 1).coerceAtLeast(1).toFloat()
+        val halfScaleX = (halfW - 1).toFloat() * invSensorWm1
+        val halfScaleY = (halfH - 1).toFloat() * invSensorHm1
+        val quarterScaleX = (quarterW - 1).toFloat() * invSensorWm1
+        val quarterScaleY = (quarterH - 1).toFloat() * invSensorHm1
 
         // STEP 3: No top shoulder in tone curve — maps 1.0 -> 1.0
         val toneLut = buildDigicamToneLut(
-            shadowRollOff = (spec.shadowRollOff + if (flashActive) 0.10f else 0f) * strength,
+            shadowRollOff = (spec.shadowRollOff + if (flashActive) 0.04f else 0f) * strength,
             midtoneGamma = 1f + (spec.midtoneGamma - 1f) * strength,
-            contrast = (spec.toneContrast + if (flashActive) 0.06f else 0f) * strength
+            contrast = (spec.toneContrast + if (flashActive) 0.03f else 0f) * strength
         )
 
         val m = spec.colorMatrix3x3
@@ -329,10 +406,11 @@ object DigicamIspPipeline {
         val smearWeight = (spec.verticalSmearStrength * tuning.bloomAndSmearMultiplier * strength / sensorH.toFloat()).coerceIn(0f, 0.20f)
         val blueVioletFringeWeight = (spec.blueVioletFringeStrength * tuning.chromaticAberrationMultiplier * strength).coerceIn(0f, 0.25f)
 
-        // STEP 3: Black clip (0.03-0.05), Pre-clip exposure gain (1.4-1.8x), White clip (0.72-0.82)
+        // STEP 3: Black clip (0.03-0.05), Pre-clip exposure gain (1.4-1.8x, moderated on flash), White clip (0.72-0.82)
         val blackClip = (spec.blackClipLinear * strength).coerceIn(0.0f, 0.055f)
         val invBlackSpan = 1f / (1f - blackClip).coerceAtLeast(0.5f)
-        val preClipExpGain = (1f + (spec.exposureBiasGain - 1f) * strength) * shotExposureDrift
+        val baseExpGain = (1f + (spec.exposureBiasGain - 1f) * strength) * shotExposureDrift
+        val effExpGain = if (flashActive) 1f + (baseExpGain - 1f) * 0.55f else baseExpGain
         val whiteClip = (1f - (1f - spec.whiteClipLinear.coerceIn(0.72f, 0.82f)) * strength).coerceIn(0.72f, 0.96f)
         val invWhiteClip = 1f / whiteClip
 
@@ -342,15 +420,17 @@ object DigicamIspPipeline {
         val sigmaChromaBlotch = (spec.shadowChromaSpeckle * tuning.ccdNoiseMultiplier * strength).coerceIn(0f, 0.065f)
         val satBoost = 1f + (spec.saturationBoost - 1f) * strength
 
-        val yTonePlane = rLin
-        val cbPlane = gLin
-        val crPlane = bLin
-        val readNoiseYStore = bBlurCorner
+        // Overwrite rLens / gLens / bLens in-place with Y / Cb / Cr
+        val yTonePlane = rLens
+        val cbPlane = gLens
+        val crPlane = bLens
         var clippedCount = 0
         var peakSmear = 0f
 
         for (y in 0 until sensorH) {
             val rowOffset = y * sensorW
+            val halfFy = y * halfScaleY
+            val quarterFy = y * quarterScaleY
 
             for (x in 0 until sensorW) {
                 val idx = rowOffset + x
@@ -390,12 +470,10 @@ object DigicamIspPipeline {
                 g = ((g - blackClip).coerceAtLeast(0f)) * invBlackSpan
                 b = ((b - blackClip).coerceAtLeast(0f)) * invBlackSpan
 
-                // STEP 3.2: Pre-clip exposure gain 1.4-1.8x (per mode)
-                if (!flashActive) {
-                    r *= preClipExpGain
-                    g *= preClipExpGain
-                    b *= preClipExpGain
-                }
+                // STEP 3.2: Pre-clip exposure gain (moderated when Xenon flash is enabled)
+                r *= effExpGain
+                g *= effExpGain
+                b *= effExpGain
 
                 // STEP 4.1: Shot noise ~ sqrt(luma) before the tone curve
                 val linY = (0.2126f * r + 0.7152f * g + 0.0722f * b).coerceAtLeast(0f)
@@ -456,11 +534,10 @@ object DigicamIspPipeline {
                 cb *= satBoost * clipDesat
                 cr *= satBoost * clipDesat
 
-                // STEP 4.2: Constant read noise injected AFTER the black crush
-                // Luma read noise at 1/1 + 1/2 res; Cb/Cr read noise at 1/4 res bilinearly upsampled
+                // STEP 4.2: Constant read noise injected AFTER the black crush (inline bilinear grid sampling)
                 val nLumaFull = pseudoGaussian(idx * 37 + imageSignature + 8191)
-                val nLumaCombined = (0.65f * nLumaFull + 0.35f * upsampledHalfLuma[idx]) * 1.148f * sigmaLumaFloor
-                readNoiseYStore[idx] = nLumaCombined
+                val nLumaHalf = sampleBilinear2D(halfLumaGrid, halfW, halfH, x * halfScaleX, halfFy)
+                val nLumaCombined = (0.65f * nLumaFull + 0.35f * nLumaHalf) * 1.148f * sigmaLumaFloor
 
                 var yWithRead = yToned + nLumaCombined
                 if (yWithRead < 0f) {
@@ -470,8 +547,9 @@ object DigicamIspPipeline {
                 yToned = yWithRead.coerceIn(0f, 1f)
 
                 val chromaFloorWeight = (0.55f + 0.45f * shadowMask) * (1f - twoChannelClipT * 0.9f)
-                cb += blotchyCbField[idx] * sigmaChromaBlotch * chromaFloorWeight
-                cr += blotchyCrField[idx] * sigmaChromaBlotch * chromaFloorWeight
+                val qFx = x * quarterScaleX
+                cb += sampleBilinear2D(quarterCbGrid, quarterW, quarterH, qFx, quarterFy) * sigmaChromaBlotch * chromaFloorWeight
+                cr += sampleBilinear2D(quarterCrGrid, quarterW, quarterH, qFx, quarterFy) * sigmaChromaBlotch * chromaFloorWeight
 
                 yTonePlane[idx] = yToned
                 cbPlane[idx] = cb
@@ -480,12 +558,21 @@ object DigicamIspPipeline {
         }
 
         // STEP 4.3: Smeary In-Camera Noise Reduction AFTER the noise step
-        val yBlurNr = boxBlurSeparable(yTonePlane, sensorW, sensorH, nrRadius, blurTmp, rLens)
-        val cbSmear = boxBlurSeparable(cbPlane, sensorW, sensorH, 1, blurTmp, gLens)
-        val crSmear = boxBlurSeparable(crPlane, sensorW, sensorH, 1, blurTmp, bLens)
-        val nrSmearWeight = (spec.deClaritySoftness * strength).coerceIn(0f, 0.75f)
+        // rLin, gLin, bLin are now free for scratch & destination buffers.
+        val yBlurNr = boxBlurSeparable(yTonePlane, sensorW, sensorH, nrRadius, blurTmp, rLin)
+        val cbSmear = if (tuning.useFullSensorResolution) {
+            cbPlane
+        } else {
+            boxBlurSeparable(cbPlane, sensorW, sensorH, 1, blurTmp, cbPlane)
+        }
+        val crSmear = if (tuning.useFullSensorResolution) {
+            crPlane
+        } else {
+            boxBlurSeparable(crPlane, sensorW, sensorH, 1, blurTmp, crPlane)
+        }
+        val nrSmearWeight = (spec.deClaritySoftness * nrSmearScale * strength).coerceIn(0f, 0.75f)
 
-        val yAfterNr = highlightExcess
+        val yAfterNr = gLin
         for (i in 0 until numPixels) {
             val yOrig = yTonePlane[i]
             val ySmooth = yBlurNr[i]
@@ -501,8 +588,7 @@ object DigicamIspPipeline {
             }
         }
 
-        // STEP 5: Luma Unsharp Mask ONLY, radius 1.0-1.5 px at internal resolution,
-        // no broad local-contrast/"clarity" step, halo amount reduced by ~40% in every mode.
+        // STEP 5: Luma Unsharp Mask ONLY, radius 1.0-1.5 px at internal resolution
         val usmRadiusPx = spec.usmRadiusPx.coerceIn(1.0f, 1.5f)
         val yBlurUsm = gaussianBlurSeparable(yAfterNr, sensorW, sensorH, usmRadiusPx, blurTmp, yBlurNr)
         val usmAmount = (spec.usmCrispness * tuning.edgeHaloUsmMultiplier * strength).coerceIn(0f, 1.2f)
@@ -516,13 +602,15 @@ object DigicamIspPipeline {
             }
         }
 
-        // Stage 6: True 4:2:0 Chroma Subsampling at Internal Sensor Size
-        val outSensorPixels = inPixels
+        // Stage 6: True 4:2:0 Chroma Subsampling streamed 2 rows at a time directly into internalBmp
+        val internalBmp = Bitmap.createBitmap(sensorW, sensorH, Bitmap.Config.ARGB_8888)
+        val rowPairPixels = IntArray(sensorW * 2)
         for (y in 0 until sensorH step 2) {
+            val rowsInChunk = min(2, sensorH - y)
             val y0 = y * sensorW
-            val y1 = min(y + 1, sensorH - 1) * sensorW
+            val y1 = min(y + 1, maxY) * sensorW
             for (x in 0 until sensorW step 2) {
-                val x1 = min(x + 1, sensorW - 1)
+                val x1 = min(x + 1, maxX)
                 val i00 = y0 + x
                 val i01 = y0 + x1
                 val i10 = y1 + x
@@ -531,24 +619,19 @@ object DigicamIspPipeline {
                 val cb420 = 0.25f * (cbSmear[i00] + cbSmear[i01] + cbSmear[i10] + cbSmear[i11])
                 val cr420 = 0.25f * (crSmear[i00] + crSmear[i01] + crSmear[i10] + crSmear[i11])
 
-                val blockIndices = intArrayOf(i00, i01, i10, i11)
-                for (idx in blockIndices) {
-                    val yVal = yAfterNr[idx].coerceIn(0f, 1f)
-
-                    val rOut = (yVal + 1.402f * cr420).coerceIn(0f, 1f)
-                    val gOut = (yVal - 0.344136f * cb420 - 0.714136f * cr420).coerceIn(0f, 1f)
-                    val bOut = (yVal + 1.772f * cb420).coerceIn(0f, 1f)
-
-                    val rInt = (rOut * 255f + 0.5f).toInt().coerceIn(0, 255)
-                    val gInt = (gOut * 255f + 0.5f).toInt().coerceIn(0, 255)
-                    val bInt = (bOut * 255f + 0.5f).toInt().coerceIn(0, 255)
-                    outSensorPixels[idx] = (0xFF shl 24) or (rInt shl 16) or (gInt shl 8) or bInt
+                rowPairPixels[x] = yCbCrToArgb(yAfterNr[i00], cb420, cr420)
+                if (x1 != x) {
+                    rowPairPixels[x1] = yCbCrToArgb(yAfterNr[i01], cb420, cr420)
+                }
+                if (rowsInChunk == 2) {
+                    rowPairPixels[sensorW + x] = yCbCrToArgb(yAfterNr[i10], cb420, cr420)
+                    if (x1 != x) {
+                        rowPairPixels[sensorW + x1] = yCbCrToArgb(yAfterNr[i11], cb420, cr420)
+                    }
                 }
             }
+            internalBmp.setPixels(rowPairPixels, 0, sensorW, 0, y, sensorW, rowsInChunk)
         }
-
-        val internalBmp = Bitmap.createBitmap(sensorW, sensorH, Bitmap.Config.ARGB_8888)
-        internalBmp.setPixels(outSensorPixels, 0, sensorW, 0, 0, sensorW, sensorH)
 
         // Stage 7: Imprint Classic 7-Segment Quartz Date Stamp AT INTERNAL SENSOR SIZE!
         if (timestampConfig.enabled) {
@@ -561,26 +644,33 @@ object DigicamIspPipeline {
             )
         }
 
-        // Stage 8: Actual JPEG Encode/Decode Round-Trip AT INTERNAL SENSOR SIZE (Q58..Q86)!
-        val effectiveJpegQuality = (spec.jpegQuality / tuning.jpegCrunchMultiplier.coerceIn(0.8f, 1.25f))
-            .roundToInt()
-            .coerceIn(56, 88)
-
-        val internalJpegBaos = ByteArrayOutputStream()
-        internalBmp.compress(Bitmap.CompressFormat.JPEG, effectiveJpegQuality, internalJpegBaos)
-        val internalJpegBytes = internalJpegBaos.toByteArray()
-        val compressedKb = (internalJpegBytes.size / 1024).coerceAtLeast(1)
-        val decodedInternalBmp = BitmapFactory.decodeByteArray(internalJpegBytes, 0, internalJpegBytes.size) ?: internalBmp
-        if (decodedInternalBmp !== internalBmp) {
-            internalBmp.recycle()
+        // Stage 8: JPEG Encode/Decode Round-Trip at internal size (skipped in crisp Full Sensor Resolution mode)
+        val effectiveJpegQuality: Int
+        var compressedKb: Int
+        val decodedInternalBmp: Bitmap
+        if (tuning.useFullSensorResolution) {
+            effectiveJpegQuality = spec.finalExportJpegQuality.coerceIn(92, 100)
+            decodedInternalBmp = internalBmp
+            compressedKb = ((sensorW * sensorH) / 6 / 1024).coerceAtLeast(1)
+        } else {
+            effectiveJpegQuality = (spec.jpegQuality / tuning.jpegCrunchMultiplier.coerceIn(0.8f, 1.25f))
+                .roundToInt()
+                .coerceIn(56, 88)
+            val internalJpegBaos = ByteArrayOutputStream()
+            internalBmp.compress(Bitmap.CompressFormat.JPEG, effectiveJpegQuality, internalJpegBaos)
+            val internalJpegBytes = internalJpegBaos.toByteArray()
+            compressedKb = (internalJpegBytes.size / 1024).coerceAtLeast(1)
+            decodedInternalBmp = BitmapFactory.decodeByteArray(internalJpegBytes, 0, internalJpegBytes.size) ?: internalBmp
+            if (decodedInternalBmp !== internalBmp) {
+                internalBmp.recycle()
+            }
         }
 
-        // STEP 2: Upscale to 1080x1440 ONLY at the end using Lanczos-3 (never bilinear),
-        // or keep full sensor resolution / native internal size when enabled.
+        // STEP 2: Upscale to 1080p ONLY on final export using Lanczos-3 (skip in preview mode or full/native size)
         val finalOutputBmp: Bitmap
         val outW: Int
         val outH: Int
-        if (tuning.useFullSensorResolution || tuning.exportNativeInternalSize) {
+        if (isPreviewMode || tuning.useFullSensorResolution || tuning.exportNativeInternalSize) {
             outW = sensorW
             outH = sensorH
             finalOutputBmp = decodedInternalBmp
@@ -596,11 +686,19 @@ object DigicamIspPipeline {
             }
         }
 
-        // STEP 2: Save the final file at Q >= 92
-        val finalSaveQuality = spec.finalExportJpegQuality.coerceIn(92, 100)
-        val exportBaos = ByteArrayOutputStream()
-        finalOutputBmp.compress(Bitmap.CompressFormat.JPEG, finalSaveQuality, exportBaos)
-        val exportJpegBytes = exportBaos.toByteArray()
+        // STEP 2: Save the final file at Q >= 92 (skip in preview mode)
+        val exportJpegBytes: ByteArray? = if (isPreviewMode) {
+            null
+        } else {
+            val finalSaveQuality = spec.finalExportJpegQuality.coerceIn(92, 100)
+            val exportBaos = ByteArrayOutputStream()
+            finalOutputBmp.compress(Bitmap.CompressFormat.JPEG, finalSaveQuality, exportBaos)
+            val bytes = exportBaos.toByteArray()
+            if (tuning.useFullSensorResolution) {
+                compressedKb = (bytes.size / 1024).coerceAtLeast(1)
+            }
+            bytes
+        }
 
         val elapsedMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
         return IspProcessedResult(
@@ -618,6 +716,18 @@ object DigicamIspPipeline {
             ),
             jpegBytes = exportJpegBytes
         )
+    }
+
+    private fun yCbCrToArgb(yRaw: Float, cb: Float, cr: Float): Int {
+        val yVal = yRaw.coerceIn(0f, 1f)
+        val rOut = (yVal + 1.402f * cr).coerceIn(0f, 1f)
+        val gOut = (yVal - 0.344136f * cb - 0.714136f * cr).coerceIn(0f, 1f)
+        val bOut = (yVal + 1.772f * cb).coerceIn(0f, 1f)
+
+        val rInt = (rOut * 255f + 0.5f).toInt().coerceIn(0, 255)
+        val gInt = (gOut * 255f + 0.5f).toInt().coerceIn(0, 255)
+        val bInt = (bOut * 255f + 0.5f).toInt().coerceIn(0, 255)
+        return (0xFF shl 24) or (rInt shl 16) or (gInt shl 8) or bInt
     }
 
     private fun linearToSrgb(lin: Float): Float {
@@ -669,7 +779,7 @@ object DigicamIspPipeline {
     }
 
     /**
-     * Bilinear 2D sampler for smooth subpixel barrel distortion and 1-2 px lateral CA shifts.
+     * Bilinear 2D sampler for smooth subpixel barrel distortion, lateral CA shifts, and compact noise grids.
      */
     private fun sampleBilinear2D(
         plane: FloatArray,
@@ -753,49 +863,6 @@ object DigicamIspPipeline {
             }
         }
         return dst
-    }
-
-    /**
-     * STEP 4: Bilinear upsampling for 1/4-res Chroma Read Noise & 1/2-res Luma Read Noise.
-     */
-    private fun upsampleBilinear(
-        grid: FloatArray,
-        gridW: Int,
-        gridH: Int,
-        dstW: Int,
-        dstH: Int,
-        dstBuf: FloatArray? = null
-    ): FloatArray {
-        val out = dstBuf ?: FloatArray(dstW * dstH)
-        val scaleX = (gridW - 1).toFloat() / (dstW - 1).coerceAtLeast(1).toFloat()
-        val scaleY = (gridH - 1).toFloat() / (dstH - 1).coerceAtLeast(1).toFloat()
-
-        for (y in 0 until dstH) {
-            val gy = y * scaleY
-            val y0 = gy.toInt().coerceIn(0, gridH - 1)
-            val y1 = (y0 + 1).coerceAtMost(gridH - 1)
-            val fy = gy - y0
-            val row0 = y0 * gridW
-            val row1 = y1 * gridW
-            val dstRow = y * dstW
-
-            for (x in 0 until dstW) {
-                val gx = x * scaleX
-                val x0 = gx.toInt().coerceIn(0, gridW - 1)
-                val x1 = (x0 + 1).coerceAtMost(gridW - 1)
-                val fx = gx - x0
-
-                val v00 = grid[row0 + x0]
-                val v01 = grid[row0 + x1]
-                val v10 = grid[row1 + x0]
-                val v11 = grid[row1 + x1]
-
-                val top = v00 + (v01 - v00) * fx
-                val bot = v10 + (v11 - v10) * fx
-                out[dstRow + x] = top + (bot - top) * fy
-            }
-        }
-        return out
     }
 
     /**
@@ -934,7 +1001,9 @@ object DigicamIspPipeline {
     ): FloatArray {
         val dst = dstBuf ?: FloatArray(width * height)
         if (radius <= 0 || width <= 2 || height <= 2) {
-            System.arraycopy(src, 0, dst, 0, src.size)
+            if (src !== dst) {
+                System.arraycopy(src, 0, dst, 0, src.size)
+            }
             return dst
         }
         val r = radius.coerceIn(1, 12)

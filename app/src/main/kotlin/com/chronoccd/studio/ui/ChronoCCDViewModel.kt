@@ -1,6 +1,7 @@
 package com.chronoccd.studio.ui
 
 import android.app.Application
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -22,15 +23,16 @@ import com.chronoccd.studio.data.NostalgicDigicamCatalog
 import com.chronoccd.studio.data.TimestampConfig
 import com.chronoccd.studio.data.TimestampFormat
 import com.chronoccd.studio.data.TimestampLedColor
-import com.chronoccd.studio.data.TimestampPosition
 import com.chronoccd.studio.isp.BuiltInDemoScenes
 import com.chronoccd.studio.isp.DemoSceneGenerator
 import com.chronoccd.studio.isp.DigicamIspPipeline
 import com.chronoccd.studio.isp.IspPipelineTelemetry
 import com.chronoccd.studio.ui.theme.ExpressiveSeedPresets
 import com.chronoccd.studio.ui.theme.SeedPreset
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -67,6 +69,7 @@ data class ChronoCCDUiState(
     val useSimulatedViewfinder: Boolean = false,
     val selectedDemoSceneId: String = BuiltInDemoScenes.first().id,
     val isCapturingPhoto: Boolean = false,
+    val pendingCapturesCount: Int = 0,
     val triggerXenonStrobeOverlay: Boolean = false,
     // Darkroom Editor state
     val sourceBitmap: Bitmap? = null,
@@ -75,7 +78,7 @@ data class ChronoCCDUiState(
     val latestTelemetry: IspPipelineTelemetry? = null,
     val isProcessingIsp: Boolean = false,
     val showOriginalComparison: Boolean = false,
-    val currentSourceLabel: String = "Y2K Nightclub Portrait (Built-in Test Scene)",
+    val currentSourceLabel: String = "No Photo Selected",
     // Saved Memory Stick Roll
     val capturedRoll: List<CapturedPhotoItem> = emptyList(),
     // Expressive Theme Settings
@@ -86,12 +89,29 @@ data class ChronoCCDUiState(
     val statusBannerMessage: String? = null
 )
 
+private data class CaptureJobRequest(
+    val rawBitmap: Bitmap,
+    val sourceNote: String,
+    val linearTonemapActive: Boolean,
+    val persona: DigicamPersona,
+    val tuning: IspUserTuning,
+    val timestampConfig: TimestampConfig
+)
+
 class ChronoCCDViewModel(application: Application) : AndroidViewModel(application) {
+
+    companion object {
+        private const val KEY_USE_FULL_SENSOR_RES = "use_full_sensor_resolution"
+        const val MAX_PENDING_CAPTURES = 4
+    }
 
     private val prefs = application.getSharedPreferences("chronoccd_prefs", Context.MODE_PRIVATE)
 
     private val _uiState = MutableStateFlow(
         ChronoCCDUiState(
+            ispTuning = IspUserTuning(
+                useFullSensorResolution = prefs.getBoolean(KEY_USE_FULL_SENSOR_RES, false)
+            ),
             syncThemeWithCamera = prefs.getBoolean("sync_theme_camera", true),
             blackAmoledTheme = prefs.getBoolean("black_amoled", false),
             darkThemeOverride = when (prefs.getInt("dark_mode_override", -1)) {
@@ -104,22 +124,54 @@ class ChronoCCDViewModel(application: Application) : AndroidViewModel(applicatio
     val uiState: StateFlow<ChronoCCDUiState> = _uiState.asStateFlow()
 
     private var pipelineJob: Job? = null
+    private var needsReprocessOnEditorOpen: Boolean = false
+    private val captureQueue = Channel<CaptureJobRequest>(Channel.UNLIMITED)
 
     init {
-        // Initialize default built-in demo scene & run initial 9-stage ISP pass
+        startCaptureQueueWorker()
         viewModelScope.launch {
-            val initialScene = withContext(Dispatchers.Default) {
-                DemoSceneGenerator.generateSceneBitmap(BuiltInDemoScenes.first().id, 960, 720)
+            try {
+                val recent = withContext(Dispatchers.IO) {
+                    loadMostRecentAppPhoto(getApplication())
+                }
+                if (recent != null && _uiState.value.sourceBitmap == null) {
+                    _uiState.update { state ->
+                        if (state.sourceBitmap == null) {
+                            state.copy(
+                                sourceBitmap = recent.first,
+                                sourceLinearTonemapActive = false,
+                                processedBitmap = recent.first,
+                                currentSourceLabel = recent.second
+                            )
+                        } else {
+                            recent.first.recycle()
+                            state
+                        }
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                // Non-fatal: app opens cleanly with empty editor state
             }
-            _uiState.update { it.copy(sourceBitmap = initialScene) }
-            reprocessCurrentImage(force = true)
         }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        pipelineJob?.cancel()
+        captureQueue.close()
     }
 
     fun selectTab(tab: AppTab) {
         val prevTab = _uiState.value.currentTab
         _uiState.update { it.copy(currentTab = tab) }
-        if (tab != AppTab.CAMERA && prevTab == AppTab.CAMERA) {
+        val state = _uiState.value
+        if (tab != AppTab.CAMERA && prevTab == AppTab.CAMERA &&
+            state.sourceBitmap != null &&
+            (needsReprocessOnEditorOpen || state.processedBitmap == null)
+        ) {
+            needsReprocessOnEditorOpen = false
             reprocessCurrentImage(force = true)
         }
     }
@@ -144,12 +196,24 @@ class ChronoCCDViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun updateIspTuning(transform: (IspUserTuning) -> IspUserTuning) {
-        _uiState.update { it.copy(ispTuning = transform(it.ispTuning)) }
+        var updatedFullRes = _uiState.value.ispTuning.useFullSensorResolution
+        _uiState.update { state ->
+            val next = transform(state.ispTuning)
+            updatedFullRes = next.useFullSensorResolution
+            state.copy(ispTuning = next)
+        }
+        prefs.edit().putBoolean(KEY_USE_FULL_SENSOR_RES, updatedFullRes).apply()
         reprocessCurrentImage()
     }
 
     fun resetIspTuningToCameraDefault() {
-        _uiState.update { it.copy(ispTuning = IspUserTuning()) }
+        _uiState.update { state ->
+            state.copy(
+                ispTuning = IspUserTuning(
+                    useFullSensorResolution = state.ispTuning.useFullSensorResolution
+                )
+            )
+        }
         reprocessCurrentImage()
     }
 
@@ -166,8 +230,9 @@ class ChronoCCDViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun toggleFullSensorResolution() {
+        var nextFull = false
         _uiState.update { state ->
-            val nextFull = !state.ispTuning.useFullSensorResolution
+            nextFull = !state.ispTuning.useFullSensorResolution
             state.copy(
                 ispTuning = state.ispTuning.copy(useFullSensorResolution = nextFull),
                 statusBannerMessage = if (nextFull) {
@@ -177,6 +242,7 @@ class ChronoCCDViewModel(application: Application) : AndroidViewModel(applicatio
                 }
             )
         }
+        prefs.edit().putBoolean(KEY_USE_FULL_SENSOR_RES, nextFull).apply()
         reprocessCurrentImage()
     }
 
@@ -250,41 +316,60 @@ class ChronoCCDViewModel(application: Application) : AndroidViewModel(applicatio
     fun loadBuiltInDemoScene(sceneId: String) {
         val preset = BuiltInDemoScenes.find { it.id == sceneId } ?: BuiltInDemoScenes.first()
         viewModelScope.launch {
-            val bmp = withContext(Dispatchers.Default) {
-                DemoSceneGenerator.generateSceneBitmap(preset.id, 960, 720)
+            try {
+                val bmp = withContext(Dispatchers.Default) {
+                    DemoSceneGenerator.generateSceneBitmap(preset.id, 960, 720)
+                }
+                _uiState.update {
+                    it.copy(
+                        selectedDemoSceneId = preset.id,
+                        sourceBitmap = bmp,
+                        sourceLinearTonemapActive = false,
+                        currentSourceLabel = "${preset.title} (${preset.badge})"
+                    )
+                }
+                reprocessCurrentImage()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                showBannerMessage("Failed to load test scene.")
             }
-            _uiState.update {
-                it.copy(
-                    selectedDemoSceneId = preset.id,
-                    sourceBitmap = bmp,
-                    currentSourceLabel = "${preset.title} (${preset.badge})"
-                )
-            }
-            reprocessCurrentImage()
         }
     }
 
     fun loadImageFromUri(uri: Uri) {
         viewModelScope.launch {
             _uiState.update { it.copy(isProcessingIsp = true) }
-            val loaded = withContext(Dispatchers.IO) {
-                decodeSampledBitmapFromUri(getApplication(), uri, 4096)
-            }
-            if (loaded != null) {
-                _uiState.update {
-                    it.copy(
-                        sourceBitmap = loaded,
-                        sourceLinearTonemapActive = false,
-                        currentSourceLabel = "Imported Photo • ${loaded.width}×${loaded.height}",
-                        currentTab = AppTab.DARKROOM
-                    )
+            try {
+                val loaded = withContext(Dispatchers.IO) {
+                    decodeSampledBitmapFromUri(getApplication(), uri, 4096)
                 }
-                reprocessCurrentImage()
-            } else {
+                if (loaded != null) {
+                    needsReprocessOnEditorOpen = false
+                    _uiState.update {
+                        it.copy(
+                            sourceBitmap = loaded,
+                            sourceLinearTonemapActive = false,
+                            currentSourceLabel = "Imported Photo • ${loaded.width}×${loaded.height}",
+                            currentTab = AppTab.DARKROOM
+                        )
+                    }
+                    reprocessCurrentImage(force = true)
+                } else {
+                    _uiState.update {
+                        it.copy(
+                            isProcessingIsp = false,
+                            statusBannerMessage = "Could not decode selected image."
+                        )
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
                 _uiState.update {
                     it.copy(
                         isProcessingIsp = false,
-                        statusBannerMessage = "Could not decode selected image."
+                        statusBannerMessage = "Could not open selected image."
                     )
                 }
             }
@@ -296,76 +381,151 @@ class ChronoCCDViewModel(application: Application) : AndroidViewModel(applicatio
         sourceNote: String = "Viewfinder Capture",
         linearTonemapActive: Boolean = false
     ) {
-        viewModelScope.launch {
-            val state = _uiState.value
-            _uiState.update {
-                it.copy(
-                    isCapturingPhoto = true,
-                    triggerXenonStrobeOverlay = state.ispTuning.xenonFlashEnabled
-                )
-            }
+        if (rawBitmap == null) {
+            showBannerMessage("Capture failed: camera returned an empty frame.")
+            return
+        }
 
-            val inputBmp = rawBitmap ?: withContext(Dispatchers.Default) {
-                DemoSceneGenerator.generateSceneBitmap(state.selectedDemoSceneId, 1280, 960)
-            }
-            val effectiveLinearTonemap = if (rawBitmap != null) linearTonemapActive else false
+        val state = _uiState.value
+        if (state.pendingCapturesCount >= MAX_PENDING_CAPTURES) {
+            if (!rawBitmap.isRecycled) rawBitmap.recycle()
+            showBannerMessage("Processing queue full ($MAX_PENDING_CAPTURES shots) — wait a moment.")
+            return
+        }
 
-            val fullResult = withContext(Dispatchers.Default) {
-                DigicamIspPipeline.processBitmap(
-                    source = inputBmp,
-                    persona = state.selectedPersona,
-                    tuning = state.ispTuning,
-                    timestampConfig = state.timestampConfig,
-                    isPreviewMode = false,
-                    linearTonemapActive = effectiveLinearTonemap
-                )
-            }
+        val request = CaptureJobRequest(
+            rawBitmap = rawBitmap,
+            sourceNote = sourceNote,
+            linearTonemapActive = linearTonemapActive,
+            persona = state.selectedPersona,
+            tuning = state.ispTuning,
+            timestampConfig = state.timestampConfig
+        )
 
-            val (savedRollItem, gallerySuccess) = withContext(Dispatchers.IO) {
-                val item = saveProcessedBitmapToAppRoll(
-                    context = getApplication(),
-                    bitmap = fullResult.bitmap,
-                    jpegBytes = fullResult.jpegBytes,
-                    persona = state.selectedPersona,
-                    timestampConfig = state.timestampConfig,
-                    telemetry = fullResult.telemetry,
-                    flashUsed = state.ispTuning.xenonFlashEnabled
-                )
-                val exported = exportBitmapToMediaStore(
-                    context = getApplication(),
-                    bitmap = fullResult.bitmap,
-                    jpegBytes = fullResult.jpegBytes,
-                    persona = state.selectedPersona,
-                    jpegQuality = fullResult.telemetry.effectiveJpegQuality
-                )
-                item to exported
-            }
+        _uiState.update { current ->
+            val nextPending = current.pendingCapturesCount + 1
+            current.copy(
+                pendingCapturesCount = nextPending,
+                isCapturingPhoto = true,
+                triggerXenonStrobeOverlay = request.tuning.xenonFlashEnabled
+            )
+        }
 
-            val editorSourceBmp = if (!state.ispTuning.useFullSensorResolution && maxOf(inputBmp.width, inputBmp.height) > 2048) {
-                val scale = 2048f / maxOf(inputBmp.width, inputBmp.height).toFloat()
-                val sw = (inputBmp.width * scale).toInt().coerceAtLeast(64)
-                val sh = (inputBmp.height * scale).toInt().coerceAtLeast(64)
-                Bitmap.createScaledBitmap(inputBmp, sw, sh, true)
-            } else {
-                inputBmp
-            }
-
+        val sent = captureQueue.trySend(request).isSuccess
+        if (!sent) {
+            if (!rawBitmap.isRecycled) rawBitmap.recycle()
             _uiState.update { current ->
+                val nextPending = (current.pendingCapturesCount - 1).coerceAtLeast(0)
                 current.copy(
-                    isCapturingPhoto = false,
-                    triggerXenonStrobeOverlay = false,
-                    sourceBitmap = editorSourceBmp,
-                    sourceLinearTonemapActive = effectiveLinearTonemap,
-                    processedBitmap = fullResult.bitmap,
-                    latestTelemetry = fullResult.telemetry,
-                    currentSourceLabel = "$sourceNote • ${state.selectedPersona.shortCode}",
-                    capturedRoll = listOfNotNull(savedRollItem) + current.capturedRoll,
-                    statusBannerMessage = if (gallerySuccess) {
-                        "Saved ${state.selectedPersona.displayName} photo to device (Pictures/ChronoCCD)"
-                    } else {
-                        "Captured with ${state.selectedPersona.shortCode} ISP (${fullResult.telemetry.processingTimeMs} ms)"
-                    }
+                    pendingCapturesCount = nextPending,
+                    isCapturingPhoto = nextPending > 0,
+                    triggerXenonStrobeOverlay = false
                 )
+            }
+        }
+    }
+
+    private fun startCaptureQueueWorker() {
+        viewModelScope.launch {
+            for (job in captureQueue) {
+                var keepRawAsEditorSource = false
+                try {
+                    val fullResult = withContext(Dispatchers.Default) {
+                        DigicamIspPipeline.processBitmap(
+                            source = job.rawBitmap,
+                            persona = job.persona,
+                            tuning = job.tuning,
+                            timestampConfig = job.timestampConfig,
+                            isPreviewMode = false,
+                            linearTonemapActive = job.linearTonemapActive
+                        )
+                    }
+
+                    val (savedRollItem, gallerySuccess) = withContext(Dispatchers.IO) {
+                        val item = saveProcessedBitmapToAppRoll(
+                            context = getApplication(),
+                            bitmap = fullResult.bitmap,
+                            jpegBytes = fullResult.jpegBytes,
+                            persona = job.persona,
+                            timestampConfig = job.timestampConfig,
+                            telemetry = fullResult.telemetry,
+                            flashUsed = job.tuning.xenonFlashEnabled
+                        )
+                        val exported = exportBitmapToMediaStore(
+                            context = getApplication(),
+                            bitmap = fullResult.bitmap,
+                            jpegBytes = fullResult.jpegBytes,
+                            persona = job.persona,
+                            jpegQuality = fullResult.telemetry.effectiveJpegQuality
+                        )
+                        item to exported
+                    }
+
+                    val remainingAfterThis = (_uiState.value.pendingCapturesCount - 1).coerceAtLeast(0)
+                    val editorSourceBmp: Bitmap? = if (remainingAfterThis == 0) {
+                        if (!job.tuning.useFullSensorResolution && maxOf(job.rawBitmap.width, job.rawBitmap.height) > 2048) {
+                            val scale = 2048f / maxOf(job.rawBitmap.width, job.rawBitmap.height).toFloat()
+                            val sw = (job.rawBitmap.width * scale).toInt().coerceAtLeast(64)
+                            val sh = (job.rawBitmap.height * scale).toInt().coerceAtLeast(64)
+                            withContext(Dispatchers.Default) {
+                                Bitmap.createScaledBitmap(job.rawBitmap, sw, sh, true)
+                            }
+                        } else {
+                            keepRawAsEditorSource = true
+                            job.rawBitmap
+                        }
+                    } else {
+                        null
+                    }
+
+                    needsReprocessOnEditorOpen = false
+                    _uiState.update { current ->
+                        val nextPending = (current.pendingCapturesCount - 1).coerceAtLeast(0)
+                        current.copy(
+                            pendingCapturesCount = nextPending,
+                            isCapturingPhoto = nextPending > 0,
+                            triggerXenonStrobeOverlay = false,
+                            sourceBitmap = editorSourceBmp ?: current.sourceBitmap,
+                            sourceLinearTonemapActive = if (editorSourceBmp != null) {
+                                job.linearTonemapActive
+                            } else {
+                                current.sourceLinearTonemapActive
+                            },
+                            processedBitmap = fullResult.bitmap,
+                            latestTelemetry = fullResult.telemetry,
+                            currentSourceLabel = "${job.sourceNote} • ${job.persona.shortCode}",
+                            capturedRoll = listOfNotNull(savedRollItem) + current.capturedRoll,
+                            statusBannerMessage = if (nextPending == 0) {
+                                if (gallerySuccess) {
+                                    "Saved ${job.persona.displayName} photo to device (Pictures/ChronoCCD)"
+                                } else {
+                                    "Captured with ${job.persona.shortCode} ISP (${fullResult.telemetry.processingTimeMs} ms)"
+                                }
+                            } else {
+                                current.statusBannerMessage
+                            }
+                        )
+                    }
+                } catch (e: CancellationException) {
+                    if (!keepRawAsEditorSource && !job.rawBitmap.isRecycled) {
+                        job.rawBitmap.recycle()
+                    }
+                    throw e
+                } catch (e: Throwable) {
+                    _uiState.update { current ->
+                        val nextPending = (current.pendingCapturesCount - 1).coerceAtLeast(0)
+                        current.copy(
+                            pendingCapturesCount = nextPending,
+                            isCapturingPhoto = nextPending > 0,
+                            triggerXenonStrobeOverlay = false,
+                            statusBannerMessage = "Capture processing failed: ${e.message ?: "Out of memory or I/O error"}"
+                        )
+                    }
+                } finally {
+                    if (!keepRawAsEditorSource && !job.rawBitmap.isRecycled) {
+                        job.rawBitmap.recycle()
+                    }
+                }
             }
         }
     }
@@ -376,49 +536,60 @@ class ChronoCCDViewModel(application: Application) : AndroidViewModel(applicatio
 
         viewModelScope.launch {
             _uiState.update { it.copy(isProcessingIsp = true) }
-            val highResResult = withContext(Dispatchers.Default) {
-                DigicamIspPipeline.processBitmap(
-                    source = source,
-                    persona = state.selectedPersona,
-                    tuning = state.ispTuning,
-                    timestampConfig = state.timestampConfig,
-                    isPreviewMode = false,
-                    linearTonemapActive = state.sourceLinearTonemapActive
-                )
-            }
+            try {
+                val highResResult = withContext(Dispatchers.Default) {
+                    DigicamIspPipeline.processBitmap(
+                        source = source,
+                        persona = state.selectedPersona,
+                        tuning = state.ispTuning,
+                        timestampConfig = state.timestampConfig,
+                        isPreviewMode = false,
+                        linearTonemapActive = state.sourceLinearTonemapActive
+                    )
+                }
 
-            val (rollItem, gallerySuccess) = withContext(Dispatchers.IO) {
-                val item = saveProcessedBitmapToAppRoll(
-                    context = getApplication(),
-                    bitmap = highResResult.bitmap,
-                    jpegBytes = highResResult.jpegBytes,
-                    persona = state.selectedPersona,
-                    timestampConfig = state.timestampConfig,
-                    telemetry = highResResult.telemetry,
-                    flashUsed = state.ispTuning.xenonFlashEnabled
-                )
-                val exported = exportBitmapToMediaStore(
-                    context = getApplication(),
-                    bitmap = highResResult.bitmap,
-                    jpegBytes = highResResult.jpegBytes,
-                    persona = state.selectedPersona,
-                    jpegQuality = highResResult.telemetry.effectiveJpegQuality
-                )
-                item to exported
-            }
+                val (rollItem, gallerySuccess) = withContext(Dispatchers.IO) {
+                    val item = saveProcessedBitmapToAppRoll(
+                        context = getApplication(),
+                        bitmap = highResResult.bitmap,
+                        jpegBytes = highResResult.jpegBytes,
+                        persona = state.selectedPersona,
+                        timestampConfig = state.timestampConfig,
+                        telemetry = highResResult.telemetry,
+                        flashUsed = state.ispTuning.xenonFlashEnabled
+                    )
+                    val exported = exportBitmapToMediaStore(
+                        context = getApplication(),
+                        bitmap = highResResult.bitmap,
+                        jpegBytes = highResResult.jpegBytes,
+                        persona = state.selectedPersona,
+                        jpegQuality = highResResult.telemetry.effectiveJpegQuality
+                    )
+                    item to exported
+                }
 
-            _uiState.update { current ->
-                current.copy(
-                    isProcessingIsp = false,
-                    processedBitmap = highResResult.bitmap,
-                    latestTelemetry = highResResult.telemetry,
-                    capturedRoll = listOfNotNull(rollItem) + current.capturedRoll,
-                    statusBannerMessage = if (gallerySuccess) {
-                        "Saved ${state.selectedPersona.shortCode} photo to Gallery (Pictures/ChronoCCD)"
-                    } else {
-                        "Saved ${state.selectedPersona.shortCode} photo to Memory Stick Roll"
-                    }
-                )
+                _uiState.update { current ->
+                    current.copy(
+                        isProcessingIsp = false,
+                        processedBitmap = highResResult.bitmap,
+                        latestTelemetry = highResResult.telemetry,
+                        capturedRoll = listOfNotNull(rollItem) + current.capturedRoll,
+                        statusBannerMessage = if (gallerySuccess) {
+                            "Saved ${state.selectedPersona.shortCode} photo to Gallery (Pictures/ChronoCCD)"
+                        } else {
+                            "Saved ${state.selectedPersona.shortCode} photo to Memory Stick Roll"
+                        }
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                _uiState.update {
+                    it.copy(
+                        isProcessingIsp = false,
+                        statusBannerMessage = "Could not save photo: ${e.message ?: "storage error"}"
+                    )
+                }
             }
         }
     }
@@ -426,22 +597,22 @@ class ChronoCCDViewModel(application: Application) : AndroidViewModel(applicatio
     fun shareCurrentPhoto(context: Context) {
         val bmp = _uiState.value.processedBitmap ?: return
         val persona = _uiState.value.selectedPersona
+        val exportQuality = persona.ispSpec.finalExportJpegQuality.coerceIn(92, 100)
         viewModelScope.launch {
-            val shareUri = withContext(Dispatchers.IO) {
-                runCatching {
+            try {
+                val shareUri = withContext(Dispatchers.IO) {
                     val shareDir = File(context.cacheDir, "shared_images").apply { mkdirs() }
+                    cleanupOldShareFiles(shareDir)
                     val file = File(shareDir, "ChronoCCD_${persona.id}_${System.currentTimeMillis()}.jpg")
                     FileOutputStream(file).use { out ->
-                        bmp.compress(Bitmap.CompressFormat.JPEG, persona.ispSpec.jpegQuality, out)
+                        bmp.compress(Bitmap.CompressFormat.JPEG, exportQuality, out)
                     }
                     FileProvider.getUriForFile(
                         context,
                         "${context.packageName}.fileprovider",
                         file
                     )
-                }.getOrNull()
-            }
-            if (shareUri != null) {
+                }
                 val intent = Intent(Intent.ACTION_SEND).apply {
                     type = "image/jpeg"
                     putExtra(Intent.EXTRA_STREAM, shareUri)
@@ -452,28 +623,38 @@ class ChronoCCDViewModel(application: Application) : AndroidViewModel(applicatio
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
                 context.startActivity(Intent.createChooser(intent, "Share Digicam Photo"))
-            } else {
-                _uiState.update { it.copy(statusBannerMessage = "Unable to prepare image for sharing.") }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                showBannerMessage("Unable to prepare image for sharing.")
             }
         }
     }
 
     fun openRollItemInDarkroom(item: CapturedPhotoItem) {
         viewModelScope.launch {
-            val bmp = withContext(Dispatchers.IO) {
-                BitmapFactory.decodeFile(item.filePath)
-            }
-            val persona = NostalgicDigicamCatalog.find { it.id == item.personaId } ?: _uiState.value.selectedPersona
-            if (bmp != null) {
-                _uiState.update {
-                    it.copy(
-                        selectedPersona = persona,
-                        sourceBitmap = bmp,
-                        processedBitmap = bmp,
-                        currentSourceLabel = "Memory Stick • ${item.personaShortCode}",
-                        currentTab = AppTab.DARKROOM
-                    )
+            try {
+                val bmp = withContext(Dispatchers.IO) {
+                    decodeSampledBitmapFromFile(File(item.filePath), 4096)
                 }
+                val persona = NostalgicDigicamCatalog.find { it.id == item.personaId } ?: _uiState.value.selectedPersona
+                if (bmp != null) {
+                    needsReprocessOnEditorOpen = false
+                    _uiState.update {
+                        it.copy(
+                            selectedPersona = persona,
+                            sourceBitmap = bmp,
+                            sourceLinearTonemapActive = false,
+                            processedBitmap = bmp,
+                            currentSourceLabel = "Memory Stick • ${item.personaShortCode}",
+                            currentTab = AppTab.DARKROOM
+                        )
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                showBannerMessage("Could not open saved photo.")
             }
         }
     }
@@ -516,34 +697,126 @@ class ChronoCCDViewModel(application: Application) : AndroidViewModel(applicatio
         prefs.edit().putBoolean("black_amoled", enabled).apply()
     }
 
+    fun showBannerMessage(message: String) {
+        _uiState.update { it.copy(statusBannerMessage = message) }
+    }
+
     fun clearBannerMessage() {
         _uiState.update { it.copy(statusBannerMessage = null) }
     }
 
     private fun reprocessCurrentImage(force: Boolean = false) {
         val state = _uiState.value
-        if (!force && state.currentTab == AppTab.CAMERA) return
+        if (!force && state.currentTab == AppTab.CAMERA) {
+            needsReprocessOnEditorOpen = true
+            return
+        }
         val source = state.sourceBitmap ?: return
 
+        needsReprocessOnEditorOpen = false
         pipelineJob?.cancel()
         pipelineJob = viewModelScope.launch {
             _uiState.update { it.copy(isProcessingIsp = true) }
-            val result = withContext(Dispatchers.Default) {
-                DigicamIspPipeline.processBitmap(
-                    source = source,
-                    persona = state.selectedPersona,
-                    tuning = state.ispTuning,
-                    timestampConfig = state.timestampConfig,
-                    isPreviewMode = true,
-                    linearTonemapActive = state.sourceLinearTonemapActive
-                )
+            try {
+                val result = withContext(Dispatchers.Default) {
+                    DigicamIspPipeline.processBitmap(
+                        source = source,
+                        persona = state.selectedPersona,
+                        tuning = state.ispTuning,
+                        timestampConfig = state.timestampConfig,
+                        isPreviewMode = true,
+                        linearTonemapActive = state.sourceLinearTonemapActive
+                    )
+                }
+                _uiState.update {
+                    it.copy(
+                        processedBitmap = result.bitmap,
+                        latestTelemetry = result.telemetry,
+                        isProcessingIsp = false
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                _uiState.update {
+                    it.copy(
+                        isProcessingIsp = false,
+                        statusBannerMessage = "Processing failed: ${e.message ?: "unexpected error"}"
+                    )
+                }
             }
-            _uiState.update {
-                it.copy(
-                    processedBitmap = result.bitmap,
-                    latestTelemetry = result.telemetry,
-                    isProcessingIsp = false
-                )
+        }
+    }
+
+    private fun loadMostRecentAppPhoto(context: Context): Pair<Bitmap, String>? {
+        val rollDir = File(context.filesDir, "roll")
+        if (rollDir.isDirectory) {
+            val newestRollFile = rollDir.listFiles()
+                ?.filter { f ->
+                    f.isFile && (f.name.endsWith(".jpg", ignoreCase = true) ||
+                        f.name.endsWith(".jpeg", ignoreCase = true))
+                }
+                ?.maxByOrNull { it.lastModified() }
+            if (newestRollFile != null) {
+                val bmp = decodeSampledBitmapFromFile(newestRollFile, 4096)
+                if (bmp != null) {
+                    return bmp to "Recent Capture • ${newestRollFile.nameWithoutExtension}"
+                }
+            }
+        }
+
+        return runCatching {
+            val resolver = context.contentResolver
+            val projection = arrayOf(
+                MediaStore.Images.Media._ID,
+                MediaStore.Images.Media.DISPLAY_NAME
+            )
+            val selection: String
+            val selectionArgs: Array<String>
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                selection = "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?"
+                selectionArgs = arrayOf("%${Environment.DIRECTORY_PICTURES}/ChronoCCD%")
+            } else {
+                @Suppress("DEPRECATION")
+                selection = "${MediaStore.Images.Media.DATA} LIKE ?"
+                selectionArgs = arrayOf("%ChronoCCD%")
+            }
+            val sortOrder = "${MediaStore.Images.Media.DATE_MODIFIED} DESC"
+            resolver.query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                projection,
+                selection,
+                selectionArgs,
+                sortOrder
+            )?.use { cursor ->
+                val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                val nameCol = cursor.getColumnIndex(MediaStore.Images.Media.DISPLAY_NAME)
+                if (cursor.moveToFirst()) {
+                    val id = cursor.getLong(idCol)
+                    val displayName = if (nameCol >= 0) cursor.getString(nameCol) else "ChronoCCD"
+                    val contentUri = ContentUris.withAppendedId(
+                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                        id
+                    )
+                    val bmp = decodeSampledBitmapFromUri(context, contentUri, 4096)
+                    if (bmp != null) {
+                        bmp to "ChronoCCD • $displayName"
+                    } else {
+                        null
+                    }
+                } else {
+                    null
+                }
+            }
+        }.getOrNull()
+    }
+
+    private fun cleanupOldShareFiles(shareDir: File) {
+        val files = shareDir.listFiles()?.sortedByDescending { it.lastModified() } ?: return
+        val cutoffMs = System.currentTimeMillis() - 10 * 60 * 1000L
+        files.forEachIndexed { index, file ->
+            if (index >= 4 || file.lastModified() < cutoffMs) {
+                runCatching { file.delete() }
             }
         }
     }
@@ -592,7 +865,8 @@ class ChronoCCDViewModel(application: Application) : AndroidViewModel(applicatio
         persona: DigicamPersona,
         jpegQuality: Int
     ): Boolean {
-        return runCatching {
+        var insertedUri: Uri? = null
+        return try {
             val filename = "DSC_${persona.shortCode.replace("-", "_")}_${System.currentTimeMillis()}.jpg"
             val values = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, filename)
@@ -604,11 +878,16 @@ class ChronoCCDViewModel(application: Application) : AndroidViewModel(applicatio
             }
             val resolver = context.contentResolver
             val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return false
-            resolver.openOutputStream(uri)?.use { out ->
+            insertedUri = uri
+            val stream = resolver.openOutputStream(uri)
+                ?: throw IllegalStateException("Failed to open MediaStore stream")
+            stream.use { out ->
                 if (jpegBytes != null) {
                     out.write(jpegBytes)
                 } else {
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, jpegQuality, out)
+                    if (!bitmap.compress(Bitmap.CompressFormat.JPEG, jpegQuality, out)) {
+                        throw IllegalStateException("Failed to compress JPEG to MediaStore")
+                    }
                 }
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -617,7 +896,48 @@ class ChronoCCDViewModel(application: Application) : AndroidViewModel(applicatio
                 resolver.update(uri, values, null, null)
             }
             true
-        }.getOrDefault(false)
+        } catch (e: CancellationException) {
+            insertedUri?.let { orphan ->
+                runCatching { context.contentResolver.delete(orphan, null, null) }
+            }
+            throw e
+        } catch (_: Throwable) {
+            insertedUri?.let { orphan ->
+                runCatching { context.contentResolver.delete(orphan, null, null) }
+            }
+            false
+        }
+    }
+
+    private fun decodeSampledBitmapFromFile(
+        file: File,
+        maxDimension: Int
+    ): Bitmap? {
+        return runCatching {
+            val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, boundsOpts)
+            if (boundsOpts.outWidth <= 0 || boundsOpts.outHeight <= 0) return null
+
+            var sampleSize = 1
+            while (boundsOpts.outWidth / sampleSize > maxDimension * 2 ||
+                boundsOpts.outHeight / sampleSize > maxDimension * 2
+            ) {
+                sampleSize *= 2
+            }
+
+            val decodeOpts = BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            val rawBmp = BitmapFactory.decodeFile(file.absolutePath, decodeOpts) ?: return null
+            val orientation = runCatching {
+                ExifInterface(file.absolutePath).getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_NORMAL
+                )
+            }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+            applyExifOrientation(rawBmp, orientation)
+        }.getOrNull()
     }
 
     private fun decodeSampledBitmapFromUri(
@@ -646,24 +966,39 @@ class ChronoCCDViewModel(application: Application) : AndroidViewModel(applicatio
                 BitmapFactory.decodeStream(it, null, decodeOpts)
             } ?: return null
 
-            val rotation = resolver.openInputStream(uri)?.use { input ->
-                val exif = ExifInterface(input)
-                when (exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
-                    ExifInterface.ORIENTATION_ROTATE_90 -> 90f
-                    ExifInterface.ORIENTATION_ROTATE_180 -> 180f
-                    ExifInterface.ORIENTATION_ROTATE_270 -> 270f
-                    else -> 0f
-                }
-            } ?: 0f
+            val orientation = resolver.openInputStream(uri)?.use { input ->
+                ExifInterface(input).getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_NORMAL
+                )
+            } ?: ExifInterface.ORIENTATION_NORMAL
 
-            if (rotation != 0f) {
-                val matrix = Matrix().apply { postRotate(rotation) }
-                val rotated = Bitmap.createBitmap(rawBmp, 0, 0, rawBmp.width, rawBmp.height, matrix, true)
-                if (rotated !== rawBmp) rawBmp.recycle()
-                rotated
-            } else {
-                rawBmp
-            }
+            applyExifOrientation(rawBmp, orientation)
         }.getOrNull()
+    }
+
+    private fun applyExifOrientation(rawBmp: Bitmap, orientation: Int): Bitmap {
+        val matrix = Matrix()
+        when (orientation) {
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
+            ExifInterface.ORIENTATION_TRANSPOSE -> {
+                matrix.postRotate(90f)
+                matrix.postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+            ExifInterface.ORIENTATION_TRANSVERSE -> {
+                matrix.postRotate(270f)
+                matrix.postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+            else -> return rawBmp
+        }
+        val transformed = Bitmap.createBitmap(rawBmp, 0, 0, rawBmp.width, rawBmp.height, matrix, true)
+        if (transformed !== rawBmp) {
+            rawBmp.recycle()
+        }
+        return transformed
     }
 }

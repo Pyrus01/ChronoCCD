@@ -4,8 +4,10 @@ import com.chronoccd.studio.data.NostalgicDigicamCatalog
 import com.chronoccd.studio.data.TimestampConfig
 import com.chronoccd.studio.data.TimestampFormat
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.time.LocalDateTime
 
 class DigicamIspPipelineTest {
 
@@ -63,5 +65,38 @@ class DigicamIspPipelineTest {
             "29.10.2006 17:49",
             base.copy(format = TimestampFormat.FULL_DATETIME).formattedString()
         )
+    }
+
+    @Test
+    fun timestampDefaultsToLiveDateAndClampsLeapYearDay() {
+        val leapDate = LocalDateTime.of(2024, 2, 29, 9, 5)
+        val nonLeapNostalgic = TimestampConfig(
+            enabled = true,
+            format = TimestampFormat.FULL_DATETIME,
+            useNostalgicYearOverride = true,
+            nostalgicYear = 2007
+        )
+        assertEquals("28.02.2007 09:05", nonLeapNostalgic.formattedString(leapDate))
+
+        val leapNostalgic = nonLeapNostalgic.copy(nostalgicYear = 2004)
+        assertEquals("29.02.2004 09:05", leapNostalgic.formattedString(leapDate))
+
+        val liveYearConfig = nonLeapNostalgic.copy(
+            format = TimestampFormat.CYBER_DOT,
+            useNostalgicYearOverride = false
+        )
+        assertEquals("2024.02.29", liveYearConfig.formattedString(leapDate))
+    }
+
+    @Test
+    fun digicamIspSpecSupportsStructuralEqualityForColorMatrix() {
+        val baseSpec = NostalgicDigicamCatalog.first().ispSpec
+        val clonedSameMatrix = baseSpec.copy(colorMatrix3x3 = baseSpec.colorMatrix3x3.copyOf())
+        assertEquals(baseSpec, clonedSameMatrix)
+        assertEquals(baseSpec.hashCode(), clonedSameMatrix.hashCode())
+
+        val mutatedMatrix = baseSpec.colorMatrix3x3.copyOf().also { it[0] += 0.05f }
+        val differentSpec = baseSpec.copy(colorMatrix3x3 = mutatedMatrix)
+        assertNotEquals(baseSpec, differentSpec)
     }
 }

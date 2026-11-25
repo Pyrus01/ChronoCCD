@@ -1,38 +1,28 @@
 package com.chronoccd.studio.ui.screens
 
+import android.graphics.Bitmap
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.spring
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
-import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -45,17 +35,22 @@ import androidx.compose.material.icons.rounded.FlashOff
 import androidx.compose.material.icons.rounded.FlashOn
 import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.Share
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.ContainedLoadingIndicator
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilledTonalIconToggleButton
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.LoadingIndicator
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme.colorScheme
+import androidx.compose.material3.MaterialTheme.motionScheme
 import androidx.compose.material3.MaterialTheme.typography
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -64,21 +59,29 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.chronoccd.studio.data.DigicamPersona
 import com.chronoccd.studio.data.NostalgicDigicamCatalog
+import com.chronoccd.studio.isp.DigicamIspPipeline
 import com.chronoccd.studio.ui.ChronoCCDUiState
+import com.chronoccd.studio.ui.components.AdjacentModePeekStrip
+import com.chronoccd.studio.ui.components.CameraLookPill
+import com.chronoccd.studio.ui.components.ExpressiveHeroActionButton
+import com.chronoccd.studio.ui.components.ExpressiveSideActionTile
+import com.chronoccd.studio.ui.components.ExpressiveTimestampPill
 import com.chronoccd.studio.ui.components.ResolutionModeToggleBadge
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
@@ -102,6 +105,7 @@ fun EditorScreen(
     val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
     val coroutineScope = rememberCoroutineScope()
+    val motion = motionScheme
 
     val photoPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
@@ -111,11 +115,35 @@ fun EditorScreen(
         }
     }
 
+    val originalDisplayBitmap by produceState<Bitmap?>(
+        initialValue = if (uiState.sourceLinearTonemapActive) null else uiState.sourceBitmap,
+        key1 = uiState.sourceBitmap,
+        key2 = uiState.showOriginalComparison,
+        key3 = uiState.sourceLinearTonemapActive
+    ) {
+        val src = uiState.sourceBitmap
+        value = when {
+            src == null -> null
+            uiState.showOriginalComparison && uiState.sourceLinearTonemapActive -> {
+                withContext(Dispatchers.Default) {
+                    DigicamIspPipeline.encodeLinearBitmapToSrgb(src)
+                }
+            }
+            else -> src
+        }
+    }
+
     val displayBitmap = if (uiState.showOriginalComparison) {
-        uiState.sourceBitmap
+        originalDisplayBitmap ?: uiState.sourceBitmap
     } else {
         uiState.processedBitmap ?: uiState.sourceBitmap
     }
+
+    val currentIndex = NostalgicDigicamCatalog.indexOfFirst {
+        it.id == uiState.selectedPersona.id
+    }.coerceAtLeast(0)
+    val prevPersona = NostalgicDigicamCatalog[(currentIndex - 1 + NostalgicDigicamCatalog.size) % NostalgicDigicamCatalog.size]
+    val nextPersona = NostalgicDigicamCatalog[(currentIndex + 1) % NostalgicDigicamCatalog.size]
 
     val dragOffsetX = remember { Animatable(0f) }
     var swipeDirection by remember { mutableIntStateOf(1) }
@@ -123,37 +151,35 @@ fun EditorScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(Color.Black)
+            .background(colorScheme.surface)
             .padding(
                 top = contentPadding.calculateTopPadding() + 4.dp,
                 bottom = contentPadding.calculateBottomPadding() + 68.dp
             )
     ) {
-        // 1. Minimal Top Bar matching Camera Screen
+        // 1. M3 Expressive Top Bar matching Camera Screen
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 24.dp, vertical = 6.dp)
+                .padding(horizontal = 20.dp, vertical = 6.dp)
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
                     text = "ISP",
+                    style = typography.labelLarge,
                     fontWeight = FontWeight.Bold,
-                    fontSize = 12.sp,
-                    color = Color.White,
+                    color = colorScheme.onSurface,
                     letterSpacing = 0.8.sp
                 )
 
-                // Dual-state resolution toggle: Mode Predetermined Res vs Full Sensor Resolution
                 ResolutionModeToggleBadge(
                     modeLabel = uiState.selectedPersona.megapixelLabel,
                     isFullSensorRes = uiState.ispTuning.useFullSensorResolution,
-                    accentColor = uiState.selectedPersona.accentColor,
                     onToggle = {
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         onToggleFullSensorResolution()
@@ -163,55 +189,34 @@ fun EditorScreen(
 
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                // Classic Timestamp toggle + format pill
-                Surface(
-                    shape = RoundedCornerShape(50),
-                    color = if (uiState.timestampConfig.enabled) {
-                        Color.White.copy(alpha = 0.16f)
-                    } else {
-                        Color.Transparent
+                ExpressiveTimestampPill(
+                    timestampConfig = uiState.timestampConfig,
+                    icon = Icons.Rounded.AccessTime,
+                    onToggle = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onToggleTimestamp()
                     },
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(50))
-                        .clickable {
-                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onToggleTimestamp()
-                        }
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.AccessTime,
-                            contentDescription = "Toggle Classic Timestamp",
-                            tint = if (uiState.timestampConfig.enabled) Color(0xFFFF6D2E) else Color.White.copy(alpha = 0.55f),
-                            modifier = Modifier.size(18.dp)
-                        )
-                        if (uiState.timestampConfig.enabled) {
-                            Spacer(Modifier.width(5.dp))
-                            Text(
-                                text = uiState.timestampConfig.formattedString(),
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = Color(0xFFFF6D2E),
-                                modifier = Modifier.clickable {
-                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    onCycleTimestampFormat()
-                                }
-                            )
-                        }
+                    onCycleFormat = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onCycleTimestampFormat()
                     }
-                }
+                )
 
-                // Xenon Flash Effect Toggle
-                IconButton(
-                    onClick = {
+                FilledTonalIconToggleButton(
+                    checked = uiState.ispTuning.xenonFlashEnabled,
+                    onCheckedChange = {
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         onToggleXenonFlash()
-                    }
+                    },
+                    shapes = IconButtonDefaults.toggleableShapes(),
+                    colors = IconButtonDefaults.filledTonalIconToggleButtonColors(
+                        containerColor = colorScheme.surfaceContainerHigh,
+                        contentColor = colorScheme.onSurfaceVariant,
+                        checkedContainerColor = colorScheme.primaryContainer,
+                        checkedContentColor = colorScheme.onPrimaryContainer
+                    )
                 ) {
                     Icon(
                         imageVector = if (uiState.ispTuning.xenonFlashEnabled) {
@@ -220,89 +225,74 @@ fun EditorScreen(
                             Icons.Rounded.FlashOff
                         },
                         contentDescription = "Toggle Xenon Flash Effect",
-                        tint = if (uiState.ispTuning.xenonFlashEnabled) Color(0xFFFFE066) else Color.White.copy(alpha = 0.7f),
-                        modifier = Modifier.size(22.dp)
+                        modifier = Modifier.size(20.dp)
                     )
                 }
 
-                // Compare Raw vs Processed Toggle
-                IconButton(
-                    onClick = {
+                FilledTonalIconToggleButton(
+                    checked = uiState.showOriginalComparison,
+                    onCheckedChange = {
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         onSetShowOriginal(!uiState.showOriginalComparison)
-                    }
+                    },
+                    shapes = IconButtonDefaults.toggleableShapes(),
+                    colors = IconButtonDefaults.filledTonalIconToggleButtonColors(
+                        containerColor = colorScheme.surfaceContainerHigh,
+                        contentColor = colorScheme.onSurfaceVariant,
+                        checkedContainerColor = colorScheme.secondaryContainer,
+                        checkedContentColor = colorScheme.onSecondaryContainer
+                    )
                 ) {
                     Icon(
                         imageVector = Icons.Rounded.Compare,
                         contentDescription = "Compare Raw vs Processed",
-                        tint = if (uiState.showOriginalComparison) Color(0xFF87D7B8) else Color.White.copy(alpha = 0.7f),
-                        modifier = Modifier.size(22.dp)
+                        modifier = Modifier.size(20.dp)
                     )
                 }
             }
         }
 
-        // 2. Huge Rounded Photo Preview (~78% of screen) + Left/Right Look Peek Strips
+        // 2. Huge Rounded Photo Preview + Left/Right Adjacent Mode Peek Strips
         Box(
             contentAlignment = Alignment.Center,
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
         ) {
-            // Left Peeking Strip with '<' Chevron
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .align(Alignment.CenterStart)
-                    .width(15.dp)
-                    .fillMaxHeight(0.83f)
-                    .clip(RoundedCornerShape(topEnd = 16.dp, bottomEnd = 16.dp))
-                    .background(Color(0xFF2A2624).copy(alpha = 0.85f))
-                    .clickable {
-                        swipeDirection = -1
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onSwipePrevLook()
-                    }
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowLeft,
-                    contentDescription = "Previous Look",
-                    tint = Color.White.copy(alpha = 0.85f),
-                    modifier = Modifier.size(16.dp)
-                )
-            }
+            AdjacentModePeekStrip(
+                isLeft = true,
+                adjacentPersona = prevPersona,
+                icon = Icons.AutoMirrored.Rounded.KeyboardArrowLeft,
+                contentDescription = "Previous Look (${prevPersona.displayName})",
+                onClick = {
+                    swipeDirection = -1
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onSwipePrevLook()
+                },
+                modifier = Modifier.align(Alignment.CenterStart)
+            )
 
-            // Right Peeking Strip with '>' Chevron
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .align(Alignment.CenterEnd)
-                    .width(15.dp)
-                    .fillMaxHeight(0.83f)
-                    .clip(RoundedCornerShape(topStart = 16.dp, bottomStart = 16.dp))
-                    .background(Color(0xFF2A2624).copy(alpha = 0.85f))
-                    .clickable {
-                        swipeDirection = 1
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onSwipeNextLook()
-                    }
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
-                    contentDescription = "Next Look",
-                    tint = Color.White.copy(alpha = 0.85f),
-                    modifier = Modifier.size(16.dp)
-                )
-            }
+            AdjacentModePeekStrip(
+                isLeft = false,
+                adjacentPersona = nextPersona,
+                icon = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
+                contentDescription = "Next Look (${nextPersona.displayName})",
+                onClick = {
+                    swipeDirection = 1
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onSwipeNextLook()
+                },
+                modifier = Modifier.align(Alignment.CenterEnd)
+            )
 
             // Main Rounded Photo Preview Card (Swipe Left/Right to Change Look)
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(horizontal = 21.dp, vertical = 4.dp)
+                    .padding(horizontal = 22.dp, vertical = 4.dp)
                     .offset { IntOffset((dragOffsetX.value * 0.28f).roundToInt(), 0) }
                     .clip(RoundedCornerShape(34.dp))
-                    .background(Color(0xFF121212))
+                    .background(colorScheme.surfaceContainerLowest)
                     .pointerInput(uiState.selectedPersona.id) {
                         var totalDrag = 0f
                         detectHorizontalDragGestures(
@@ -330,16 +320,13 @@ fun EditorScreen(
                                 coroutineScope.launch {
                                     dragOffsetX.animateTo(
                                         targetValue = 0f,
-                                        animationSpec = spring(
-                                            dampingRatio = Spring.DampingRatioMediumBouncy,
-                                            stiffness = Spring.StiffnessMedium
-                                        )
+                                        animationSpec = motion.defaultSpatialSpec()
                                     )
                                 }
                             },
                             onDragCancel = {
                                 coroutineScope.launch {
-                                    dragOffsetX.animateTo(0f)
+                                    dragOffsetX.animateTo(0f, animationSpec = motion.defaultSpatialSpec())
                                 }
                             }
                         )
@@ -352,65 +339,87 @@ fun EditorScreen(
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()
                     )
+                } else {
+                    // Clean empty state when no photo has been captured or selected yet
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(32.dp)
+                    ) {
+                        Surface(
+                            shape = CircleShape,
+                            color = colorScheme.secondaryContainer,
+                            modifier = Modifier.size(64.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = Icons.Rounded.PhotoLibrary,
+                                    contentDescription = null,
+                                    tint = colorScheme.onSecondaryContainer,
+                                    modifier = Modifier.size(30.dp)
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(16.dp))
+                        Text(
+                            text = "No photo yet",
+                            style = typography.titleMedium,
+                            color = colorScheme.onSurface
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = "Pick a photo from your device or snap one in Camera to apply 2000s CCD color science.",
+                            style = typography.bodyMedium,
+                            color = colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center
+                        )
+                        Spacer(Modifier.height(18.dp))
+                        FilledTonalButton(
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                photoPickerLauncher.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                )
+                            },
+                            shapes = ButtonDefaults.shapes()
+                        ) {
+                            Text("Choose photo")
+                        }
+                    }
                 }
 
-                // Top-Center Translucent Look Pill (matches "Editorial" pill in screenshot)
-                Surface(
-                    shape = RoundedCornerShape(50),
-                    color = Color.Black.copy(alpha = 0.44f),
+                // Top-Center Camera Look Pill
+                CameraLookPill(
+                    persona = uiState.selectedPersona,
+                    overrideTitle = if (uiState.showOriginalComparison) "Original" else null,
+                    swipeDirection = swipeDirection,
                     modifier = Modifier
                         .align(Alignment.TopCenter)
                         .padding(top = 14.dp)
-                ) {
-                    AnimatedContent(
-                        targetState = uiState.selectedPersona,
-                        transitionSpec = {
-                            (slideInHorizontally { width -> swipeDirection * (width / 2) } + fadeIn())
-                                .togetherWith(
-                                    slideOutHorizontally { width -> -swipeDirection * (width / 2) } + fadeOut()
-                                )
-                        },
-                        label = "editorLookNamePill"
-                    ) { persona ->
-                        Text(
-                            text = if (uiState.showOriginalComparison) "Original" else persona.displayName,
-                            style = typography.labelLarge,
-                            fontWeight = FontWeight.Medium,
-                            color = Color.White,
-                            modifier = Modifier.padding(horizontal = 18.dp, vertical = 8.dp)
-                        )
-                    }
-                }
+                )
 
-                // Expressive Loading Indicator while running 9-stage ISP pipeline
+                // Expressive Contained Loading Indicator while running ISP pipeline
                 if (uiState.isProcessingIsp) {
-                    Surface(
-                        shape = CircleShape,
-                        color = Color.Black.copy(alpha = 0.50f),
-                        modifier = Modifier
-                            .align(Alignment.Center)
-                    ) {
-                        LoadingIndicator(
-                            modifier = Modifier
-                                .padding(10.dp)
-                                .size(34.dp),
-                            color = colorScheme.primary
-                        )
-                    }
+                    ContainedLoadingIndicator(
+                        modifier = Modifier.align(Alignment.Center)
+                    )
                 }
 
-                // Bottom-Center Translucent 5-Look Quick Selector Dots/Numbers Pill
+                // Bottom-Center 5-Look Quick Selector Pill
                 Surface(
                     shape = RoundedCornerShape(50),
-                    color = Color.Black.copy(alpha = 0.44f),
+                    color = colorScheme.surfaceContainerHigh.copy(alpha = 0.84f),
+                    border = BorderStroke(1.dp, colorScheme.outlineVariant.copy(alpha = 0.45f)),
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(bottom = 16.dp)
                 ) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp)
                     ) {
                         NostalgicDigicamCatalog.forEachIndexed { idx, persona ->
                             val isSelected = persona.id == uiState.selectedPersona.id
@@ -421,12 +430,22 @@ fun EditorScreen(
                                 3 -> "E32"
                                 else -> "KDK"
                             }
+                            val chipBg by animateColorAsState(
+                                targetValue = if (isSelected) colorScheme.primary else Color.Transparent,
+                                animationSpec = motion.fastEffectsSpec(),
+                                label = "editorLookChipBg"
+                            )
+                            val chipFg by animateColorAsState(
+                                targetValue = if (isSelected) colorScheme.onPrimary else colorScheme.onSurface,
+                                animationSpec = motion.fastEffectsSpec(),
+                                label = "editorLookChipFg"
+                            )
                             Box(
                                 contentAlignment = Alignment.Center,
                                 modifier = Modifier
                                     .size(38.dp)
                                     .clip(CircleShape)
-                                    .background(if (isSelected) Color.White else Color.Transparent)
+                                    .background(chipBg)
                                     .clickable {
                                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                         onSelectPersona(persona)
@@ -434,9 +453,11 @@ fun EditorScreen(
                             ) {
                                 Text(
                                     text = shortTag,
-                                    fontSize = 11.sp,
-                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                    color = if (isSelected) Color.Black else Color.White
+                                    style = typography.labelSmall.copy(
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                        fontFeatureSettings = "tnum"
+                                    ),
+                                    color = chipFg
                                 )
                             }
                         }
@@ -445,7 +466,7 @@ fun EditorScreen(
             }
         }
 
-        // 3. Bottom Action Row (Open Photo on Left, Save Button in Center, Share on Right)
+        // 3. Bottom Action Row (Pick Photo on Left, Hero Save Button in Center, Share on Right)
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -453,88 +474,64 @@ fun EditorScreen(
                 .fillMaxWidth()
                 .padding(horizontal = 42.dp, vertical = 14.dp)
         ) {
-            // Left: Pick Photo from Device Gallery
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .size(54.dp)
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(Color(0xFF282A2D))
-                    .clickable {
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        photoPickerLauncher.launch(
-                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                        )
-                    }
+            // Left: Expressive Squircle Gallery Picker Tile
+            ExpressiveSideActionTile(
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    photoPickerLauncher.launch(
+                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                    )
+                }
             ) {
                 Icon(
                     imageVector = Icons.Rounded.PhotoLibrary,
                     contentDescription = "Pick Photo from Gallery",
-                    tint = Color.White,
+                    tint = colorScheme.onSurface,
                     modifier = Modifier.size(24.dp)
                 )
             }
 
-            // Center: Save Processed Photo Button (matches Shutter Button size & feel)
-            val saveInteraction = remember { MutableInteractionSource() }
-            val isPressed by saveInteraction.collectIsPressedAsState()
-            val saveScale by animateFloatAsState(
-                targetValue = if (isPressed) 0.90f else 1.0f,
-                animationSpec = spring(stiffness = Spring.StiffnessHigh),
-                label = "saveScale"
-            )
-
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .size(84.dp)
-                    .graphicsLayer {
-                        scaleX = saveScale
-                        scaleY = saveScale
-                    }
-                    .clip(CircleShape)
-                    .border(5.dp, Color(0xFF5F6368), CircleShape)
-                    .clickable(
-                        interactionSource = saveInteraction,
-                        indication = null,
-                        enabled = !uiState.isProcessingIsp
-                    ) {
-                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        onSaveToGallery()
-                    }
-            ) {
-                Box(
-                    contentAlignment = Alignment.Center,
-                    modifier = Modifier
-                        .size(68.dp)
-                        .clip(CircleShape)
-                        .background(Color.White)
-                ) {
-                    Icon(
-                        imageVector = Icons.Rounded.Download,
-                        contentDescription = "Save Photo",
-                        tint = Color.Black,
-                        modifier = Modifier.size(28.dp)
-                    )
+            // Center: Expressive Hero Save Button
+            val hasSource = uiState.sourceBitmap != null
+            ExpressiveHeroActionButton(
+                enabled = hasSource && !uiState.isProcessingIsp,
+                busy = uiState.isProcessingIsp,
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    onSaveToGallery()
                 }
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Download,
+                    contentDescription = "Save Photo",
+                    tint = if (uiState.isProcessingIsp) {
+                        colorScheme.onPrimaryContainer
+                    } else if (hasSource) {
+                        colorScheme.surface
+                    } else {
+                        colorScheme.onSurfaceVariant
+                    },
+                    modifier = Modifier.size(28.dp)
+                )
             }
 
-            // Right: Share Processed Photo
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .size(54.dp)
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(Color(0xFF282A2D))
-                    .clickable {
+            // Right: Expressive Squircle Share Tile
+            ExpressiveSideActionTile(
+                onClick = {
+                    if (uiState.processedBitmap != null) {
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         onSharePhoto(context)
                     }
+                }
             ) {
                 Icon(
                     imageVector = Icons.Rounded.Share,
                     contentDescription = "Share Photo",
-                    tint = Color.White,
+                    tint = if (uiState.processedBitmap != null) {
+                        colorScheme.onSurface
+                    } else {
+                        colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
+                    },
                     modifier = Modifier.size(24.dp)
                 )
             }

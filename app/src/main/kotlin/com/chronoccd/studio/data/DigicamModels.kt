@@ -2,6 +2,7 @@ package com.chronoccd.studio.data
 
 import androidx.compose.ui.graphics.Color
 import java.time.LocalDateTime
+import java.time.YearMonth
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
@@ -56,26 +57,21 @@ data class TimestampConfig(
     val position: TimestampPosition = TimestampPosition.BOTTOM_RIGHT,
     val useNostalgicYearOverride: Boolean = true,
     val nostalgicYear: Int = 2007,
-    val customMonth: Int = 10,
-    val customDay: Int = 29,
-    val customHour: Int = 17,
-    val customMinute: Int = 49,
+    val customMonth: Int? = null,
+    val customDay: Int? = null,
+    val customHour: Int? = null,
+    val customMinute: Int? = null,
     val glowIntensity: Float = 0.55f,
     val scaleMultiplier: Float = 0.92f
 ) {
-    fun formattedString(): String {
-        val now = LocalDateTime.now()
+    fun formattedString(now: LocalDateTime = LocalDateTime.now()): String {
         val year = if (useNostalgicYearOverride) nostalgicYear else now.year
-        val month = customMonth.coerceIn(1, 12)
-        val day = customDay.coerceIn(1, 31)
-        val hour = customHour.coerceIn(0, 23)
-        val minute = customMinute.coerceIn(0, 59)
+        val month = (customMonth ?: now.monthValue).coerceIn(1, 12)
+        val maxDayInMonth = YearMonth.of(year, month).lengthOfMonth()
+        val safeDay = (customDay ?: now.dayOfMonth).coerceIn(1, maxDayInMonth)
+        val hour = (customHour ?: now.hour).coerceIn(0, 23)
+        val minute = (customMinute ?: now.minute).coerceIn(0, 59)
 
-        val safeDay = when (month) {
-            2 -> day.coerceAtMost(28)
-            4, 6, 9, 11 -> day.coerceAtMost(30)
-            else -> day
-        }
         val dt = LocalDateTime.of(year, month, safeDay, hour, minute)
 
         return when (format) {
@@ -145,7 +141,95 @@ data class DigicamIspSpec(
     val usmHaloLimit: Float = 0.054f,           // STEP 5: Per-mode edge halo overshoot cap (reduced by ~40% in every mode)
     val jpegQuality: Int,                       // STEP 2: 60..86 (internal JPEG encode/decode quality)
     val finalExportJpegQuality: Int = 95        // STEP 2: Final saved file quality Q >= 92
-)
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is DigicamIspSpec) return false
+
+        if (sensorLongEdgePx != other.sensorLongEdgePx) return false
+        if (sensorPitchScale != other.sensorPitchScale) return false
+        if (olpfLowPassStrength != other.olpfLowPassStrength) return false
+        if (cornerSoftness != other.cornerSoftness) return false
+        if (caKr != other.caKr) return false
+        if (caKb != other.caKb) return false
+        if (edgeCaFringingPx != other.edgeCaFringingPx) return false
+        if (barrelDistortion != other.barrelDistortion) return false
+        if (lensVignette != other.lensVignette) return false
+        if (veilingFlare != other.veilingFlare) return false
+        if (pointLightBloomThreshold != other.pointLightBloomThreshold) return false
+        if (pointLightBloomSigmaPx != other.pointLightBloomSigmaPx) return false
+        if (blueVioletFringeStrength != other.blueVioletFringeStrength) return false
+        if (blackClipLinear != other.blackClipLinear) return false
+        if (exposureBiasGain != other.exposureBiasGain) return false
+        if (whiteClipLinear != other.whiteClipLinear) return false
+        if (wbGainR != other.wbGainR) return false
+        if (wbGainG != other.wbGainG) return false
+        if (wbGainB != other.wbGainB) return false
+        if (!colorMatrix3x3.contentEquals(other.colorMatrix3x3)) return false
+        if (shadowCyanGreenTint != other.shadowCyanGreenTint) return false
+        if (highlightMagentaTilt != other.highlightMagentaTilt) return false
+        if (saturationBoost != other.saturationBoost) return false
+        if (shadowRollOff != other.shadowRollOff) return false
+        if (highlightShoulder != other.highlightShoulder) return false
+        if (midtoneGamma != other.midtoneGamma) return false
+        if (toneContrast != other.toneContrast) return false
+        if (highlightBloomAmount != other.highlightBloomAmount) return false
+        if (verticalSmearStrength != other.verticalSmearStrength) return false
+        if (fineLumaGrain != other.fineLumaGrain) return false
+        if (sigmaLumaFloor != other.sigmaLumaFloor) return false
+        if (shadowChromaSpeckle != other.shadowChromaSpeckle) return false
+        if (deClaritySoftness != other.deClaritySoftness) return false
+        if (usmRadiusPx != other.usmRadiusPx) return false
+        if (usmCrispness != other.usmCrispness) return false
+        if (usmHaloLimit != other.usmHaloLimit) return false
+        if (jpegQuality != other.jpegQuality) return false
+        if (finalExportJpegQuality != other.finalExportJpegQuality) return false
+
+        return true
+    }
+
+    override fun hashCode(): Int {
+        var result = sensorLongEdgePx
+        result = 31 * result + sensorPitchScale.hashCode()
+        result = 31 * result + olpfLowPassStrength.hashCode()
+        result = 31 * result + cornerSoftness.hashCode()
+        result = 31 * result + caKr.hashCode()
+        result = 31 * result + caKb.hashCode()
+        result = 31 * result + edgeCaFringingPx.hashCode()
+        result = 31 * result + barrelDistortion.hashCode()
+        result = 31 * result + lensVignette.hashCode()
+        result = 31 * result + veilingFlare.hashCode()
+        result = 31 * result + pointLightBloomThreshold.hashCode()
+        result = 31 * result + pointLightBloomSigmaPx.hashCode()
+        result = 31 * result + blueVioletFringeStrength.hashCode()
+        result = 31 * result + blackClipLinear.hashCode()
+        result = 31 * result + exposureBiasGain.hashCode()
+        result = 31 * result + whiteClipLinear.hashCode()
+        result = 31 * result + wbGainR.hashCode()
+        result = 31 * result + wbGainG.hashCode()
+        result = 31 * result + wbGainB.hashCode()
+        result = 31 * result + colorMatrix3x3.contentHashCode()
+        result = 31 * result + shadowCyanGreenTint.hashCode()
+        result = 31 * result + highlightMagentaTilt.hashCode()
+        result = 31 * result + saturationBoost.hashCode()
+        result = 31 * result + shadowRollOff.hashCode()
+        result = 31 * result + highlightShoulder.hashCode()
+        result = 31 * result + midtoneGamma.hashCode()
+        result = 31 * result + toneContrast.hashCode()
+        result = 31 * result + highlightBloomAmount.hashCode()
+        result = 31 * result + verticalSmearStrength.hashCode()
+        result = 31 * result + fineLumaGrain.hashCode()
+        result = 31 * result + sigmaLumaFloor.hashCode()
+        result = 31 * result + shadowChromaSpeckle.hashCode()
+        result = 31 * result + deClaritySoftness.hashCode()
+        result = 31 * result + usmRadiusPx.hashCode()
+        result = 31 * result + usmCrispness.hashCode()
+        result = 31 * result + usmHaloLimit.hashCode()
+        result = 31 * result + jpegQuality
+        result = 31 * result + finalExportJpegQuality
+        return result
+    }
+}
 
 data class IspUserTuning(
     val intensity: Float = 1.0f,

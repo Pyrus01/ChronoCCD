@@ -1,16 +1,31 @@
 package com.chronoccd.studio.ui.components
 
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.animateIntAsState
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -43,9 +58,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.chronoccd.studio.data.DigicamPersona
@@ -54,9 +71,6 @@ import com.chronoccd.studio.isp.IspPipelineTelemetry
 import com.chronoccd.studio.isp.QuartzTimestampRenderer
 import com.chronoccd.studio.ui.theme.LocalAppFonts
 import kotlin.math.roundToInt
-
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.foundation.BorderStroke
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
@@ -403,61 +417,396 @@ fun ViewfinderQuartzTimestampOverlay(
  * Toggles between each camera mode's predetermined retro resolution (VGA, 0.8MP, 1.3MP, 2MP, 4MP)
  * and the camera sensor's full native resolution for crystal clear high-res photos.
  */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun ResolutionModeToggleBadge(
     modeLabel: String,
     isFullSensorRes: Boolean,
-    accentColor: Color,
     onToggle: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val motion = motionScheme
+    val retroBg by animateColorAsState(
+        targetValue = if (!isFullSensorRes) colorScheme.secondaryContainer else Color.Transparent,
+        animationSpec = motion.defaultEffectsSpec(),
+        label = "retroResBg"
+    )
+    val retroFg by animateColorAsState(
+        targetValue = if (!isFullSensorRes) colorScheme.onSecondaryContainer else colorScheme.onSurfaceVariant,
+        animationSpec = motion.defaultEffectsSpec(),
+        label = "retroResFg"
+    )
+    val retroCorner by animateDpAsState(
+        targetValue = if (!isFullSensorRes) 10.dp else 6.dp,
+        animationSpec = motion.fastSpatialSpec(),
+        label = "retroResCorner"
+    )
+    val fullBg by animateColorAsState(
+        targetValue = if (isFullSensorRes) colorScheme.primary else Color.Transparent,
+        animationSpec = motion.defaultEffectsSpec(),
+        label = "fullResBg"
+    )
+    val fullFg by animateColorAsState(
+        targetValue = if (isFullSensorRes) colorScheme.onPrimary else colorScheme.onSurfaceVariant,
+        animationSpec = motion.defaultEffectsSpec(),
+        label = "fullResFg"
+    )
+    val fullCorner by animateDpAsState(
+        targetValue = if (isFullSensorRes) 10.dp else 6.dp,
+        animationSpec = motion.fastSpatialSpec(),
+        label = "fullResCorner"
+    )
+
     Surface(
-        shape = RoundedCornerShape(8.dp),
-        color = Color(0xFF1E1F22),
-        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.20f)),
+        shape = RoundedCornerShape(14.dp),
+        color = colorScheme.surfaceContainerHigh,
+        border = BorderStroke(1.dp, colorScheme.outlineVariant.copy(alpha = 0.7f)),
         modifier = modifier
-            .clip(RoundedCornerShape(8.dp))
+            .clip(RoundedCornerShape(14.dp))
             .clickable(onClick = onToggle)
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(2.5.dp)
+            modifier = Modifier.padding(3.dp)
         ) {
-            // Predetermined Mode Resolution Segment (e.g. "VGA", "0.8 MP", "1.3 MP", "2 MP", "4 MP")
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(if (!isFullSensorRes) Color.White else Color.Transparent)
-                    .padding(horizontal = 7.dp, vertical = 3.dp)
+                    .clip(RoundedCornerShape(retroCorner))
+                    .background(retroBg)
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
             ) {
                 Text(
                     text = modeLabel,
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = if (!isFullSensorRes) Color.Black else Color.White.copy(alpha = 0.50f),
+                    style = typography.labelSmall.copy(
+                        fontWeight = FontWeight.Bold,
+                        fontFeatureSettings = "tnum"
+                    ),
+                    color = retroFg,
                     letterSpacing = 0.3.sp
                 )
             }
 
             Spacer(Modifier.width(2.dp))
 
-            // Full Sensor Resolution Segment
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(if (isFullSensorRes) accentColor else Color.Transparent)
-                    .padding(horizontal = 7.dp, vertical = 3.dp)
+                    .clip(RoundedCornerShape(fullCorner))
+                    .background(fullBg)
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
             ) {
                 Text(
                     text = "FULL",
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = if (isFullSensorRes) Color.White else Color.White.copy(alpha = 0.50f),
+                    style = typography.labelSmall.copy(
+                        fontWeight = FontWeight.Bold,
+                        fontFeatureSettings = "tnum"
+                    ),
+                    color = fullFg,
                     letterSpacing = 0.4.sp
                 )
             }
         }
     }
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+fun AdjacentModePeekStrip(
+    isLeft: Boolean,
+    adjacentPersona: DigicamPersona,
+    icon: ImageVector,
+    contentDescription: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+    val stripWidth by animateDpAsState(
+        targetValue = if (isPressed) 20.dp else 16.dp,
+        animationSpec = motionScheme.fastSpatialSpec(),
+        label = "peekStripWidth"
+    )
+    val stripShape = if (isLeft) {
+        RoundedCornerShape(topEnd = 16.dp, bottomEnd = 16.dp)
+    } else {
+        RoundedCornerShape(topStart = 16.dp, bottomStart = 16.dp)
+    }
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier
+            .width(stripWidth)
+            .fillMaxHeight(0.83f)
+            .clip(stripShape)
+            .background(colorScheme.surfaceContainerHigh.copy(alpha = 0.92f))
+            .border(
+                width = 1.dp,
+                color = colorScheme.outlineVariant.copy(alpha = 0.65f),
+                shape = stripShape
+            )
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                onClick = onClick
+            )
+    ) {
+        Box(
+            modifier = Modifier
+                .align(if (isLeft) Alignment.CenterStart else Alignment.CenterEnd)
+                .width(2.5.dp)
+                .fillMaxHeight(0.30f)
+                .clip(CircleShape)
+                .background(adjacentPersona.accentColor.copy(alpha = 0.90f))
+        )
+        Icon(
+            imageVector = icon,
+            contentDescription = contentDescription,
+            tint = colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(15.dp)
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+fun CameraLookPill(
+    persona: DigicamPersona,
+    overrideTitle: String? = null,
+    swipeDirection: Int = 1,
+    modifier: Modifier = Modifier
+) {
+    val motion = motionScheme
+    Surface(
+        shape = RoundedCornerShape(50),
+        color = colorScheme.surfaceContainerHigh.copy(alpha = 0.84f),
+        border = BorderStroke(1.dp, colorScheme.outlineVariant.copy(alpha = 0.45f)),
+        modifier = modifier
+    ) {
+        AnimatedContent(
+            targetState = overrideTitle to persona,
+            transitionSpec = {
+                (slideInHorizontally(motion.fastSpatialSpec()) { width -> swipeDirection * (width / 2) } +
+                    fadeIn(motion.fastEffectsSpec()))
+                    .togetherWith(
+                        slideOutHorizontally(motion.fastSpatialSpec()) { width -> -swipeDirection * (width / 2) } +
+                            fadeOut(motion.fastEffectsSpec())
+                    )
+            },
+            label = "cameraLookPill"
+        ) { (titleOverride, currentPersona) ->
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+            ) {
+                if (titleOverride != null) {
+                    Text(
+                        text = titleOverride,
+                        style = typography.labelLarge,
+                        fontWeight = FontWeight.SemiBold,
+                        color = colorScheme.onSurface
+                    )
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .clip(CircleShape)
+                            .background(currentPersona.accentColor)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = currentPersona.displayName,
+                        style = typography.labelLarge,
+                        fontWeight = FontWeight.Medium,
+                        color = colorScheme.onSurface
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = "'${(currentPersona.releaseYear % 100).toString().padStart(2, '0')}",
+                        style = typography.labelMedium.copy(
+                            fontWeight = FontWeight.Bold,
+                            fontFeatureSettings = "tnum"
+                        ),
+                        color = colorScheme.primary
+                    )
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+fun ExpressiveTimestampPill(
+    timestampConfig: TimestampConfig,
+    icon: ImageVector,
+    onToggle: () -> Unit,
+    onCycleFormat: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val motion = motionScheme
+    val enabled = timestampConfig.enabled
+    val containerColor by animateColorAsState(
+        targetValue = if (enabled) colorScheme.tertiaryContainer else colorScheme.surfaceContainerHigh,
+        animationSpec = motion.defaultEffectsSpec(),
+        label = "timestampContainer"
+    )
+    val contentColor by animateColorAsState(
+        targetValue = if (enabled) colorScheme.onTertiaryContainer else colorScheme.onSurfaceVariant,
+        animationSpec = motion.defaultEffectsSpec(),
+        label = "timestampContent"
+    )
+    val cornerRadius by animateDpAsState(
+        targetValue = if (enabled) 12.dp else 20.dp,
+        animationSpec = motion.fastSpatialSpec(),
+        label = "timestampCorner"
+    )
+
+    Surface(
+        shape = RoundedCornerShape(cornerRadius),
+        color = containerColor,
+        border = if (!enabled) BorderStroke(1.dp, colorScheme.outlineVariant.copy(alpha = 0.55f)) else null,
+        modifier = modifier
+            .clip(RoundedCornerShape(cornerRadius))
+            .clickable(onClick = onToggle)
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = "Toggle Classic Timestamp",
+                tint = contentColor,
+                modifier = Modifier.size(17.dp)
+            )
+            AnimatedVisibility(visible = enabled) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = timestampConfig.formattedString(),
+                        style = typography.labelSmall.copy(
+                            fontWeight = FontWeight.SemiBold,
+                            fontFeatureSettings = "tnum"
+                        ),
+                        color = contentColor,
+                        modifier = Modifier.clickable(onClick = onCycleFormat)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+fun ExpressiveHeroActionButton(
+    enabled: Boolean,
+    busy: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    innerContent: @Composable BoxScope.() -> Unit = {}
+) {
+    val motion = motionScheme
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (isPressed && enabled) 0.91f else 1.0f,
+        animationSpec = motion.fastSpatialSpec(),
+        label = "heroButtonScale"
+    )
+    val coreCornerPercent by animateIntAsState(
+        targetValue = when {
+            busy -> 32
+            isPressed && enabled -> 36
+            else -> 50
+        },
+        animationSpec = motion.fastSpatialSpec(),
+        label = "heroCoreCorner"
+    )
+    val coreColor by animateColorAsState(
+        targetValue = when {
+            busy -> colorScheme.primaryContainer
+            enabled -> colorScheme.onSurface
+            else -> colorScheme.surfaceContainerHighest
+        },
+        animationSpec = motion.defaultEffectsSpec(),
+        label = "heroCoreColor"
+    )
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier
+            .size(84.dp)
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            }
+            .clip(CircleShape)
+            .border(
+                width = 4.dp,
+                color = if (enabled) colorScheme.outline else colorScheme.outlineVariant.copy(alpha = 0.5f),
+                shape = CircleShape
+            )
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                enabled = enabled,
+                onClick = onClick
+            )
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .size(68.dp)
+                .clip(RoundedCornerShape(percent = coreCornerPercent))
+                .background(coreColor),
+            content = innerContent
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+fun ExpressiveSideActionTile(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    content: @Composable BoxScope.() -> Unit
+) {
+    val motion = motionScheme
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+    val cornerRadius by animateDpAsState(
+        targetValue = if (isPressed) 12.dp else 18.dp,
+        animationSpec = motion.fastSpatialSpec(),
+        label = "sideTileCorner"
+    )
+    val scale by animateFloatAsState(
+        targetValue = if (isPressed) 0.94f else 1f,
+        animationSpec = motion.fastSpatialSpec(),
+        label = "sideTileScale"
+    )
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier
+            .size(56.dp)
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            }
+            .clip(RoundedCornerShape(cornerRadius))
+            .background(colorScheme.surfaceContainerHigh)
+            .border(
+                width = 1.dp,
+                color = colorScheme.outlineVariant.copy(alpha = 0.7f),
+                shape = RoundedCornerShape(cornerRadius)
+            )
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                onClick = onClick
+            ),
+        content = content
+    )
 }

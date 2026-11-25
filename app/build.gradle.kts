@@ -11,8 +11,8 @@ android {
     applicationId = "com.chronoccd.studio"
     minSdk = 26
     targetSdk = 36
-    versionCode = 4
-    versionName = "0.4"
+    versionCode = 11
+    versionName = "0.11"
   }
 
   buildTypes {

@@ -4,11 +4,16 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.ImageFormat
 import android.graphics.Matrix
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
-import android.hardware.camera2.params.TonemapCurve
 import android.os.Build
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -26,52 +31,48 @@ import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
-import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
-import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.AccessTime
+import androidx.compose.material.icons.rounded.CameraAlt
 import androidx.compose.material.icons.rounded.FlashOff
 import androidx.compose.material.icons.rounded.FlashOn
 import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.Sync
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilledTonalIconToggleButton
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.MaterialTheme.colorScheme
+import androidx.compose.material3.MaterialTheme.motionScheme
 import androidx.compose.material3.MaterialTheme.typography
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -79,6 +80,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -98,6 +100,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -106,13 +109,22 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.chronoccd.studio.data.DigicamPersona
-import com.chronoccd.studio.isp.DemoSceneGenerator
+import com.chronoccd.studio.data.NostalgicDigicamCatalog
 import com.chronoccd.studio.isp.DigicamAgslShader
 import com.chronoccd.studio.ui.ChronoCCDUiState
+import com.chronoccd.studio.ui.ChronoCCDViewModel
+import com.chronoccd.studio.ui.components.AdjacentModePeekStrip
+import com.chronoccd.studio.ui.components.CameraLookPill
+import com.chronoccd.studio.ui.components.ExpressiveHeroActionButton
+import com.chronoccd.studio.ui.components.ExpressiveSideActionTile
+import com.chronoccd.studio.ui.components.ExpressiveTimestampPill
 import com.chronoccd.studio.ui.components.ResolutionModeToggleBadge
 import com.chronoccd.studio.ui.components.ViewfinderQuartzTimestampOverlay
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.util.concurrent.Executors
+import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
@@ -129,6 +141,7 @@ fun CameraScreen(
     onToggleCameraLens: () -> Unit,
     onSetZoom: (Float) -> Unit,
     onCapturePhoto: (Bitmap?, String, Boolean) -> Unit,
+    onCaptureError: (String) -> Unit = {},
     onPickGalleryUri: (android.net.Uri) -> Unit,
     onOpenEditor: () -> Unit,
     onToggleNativeSizeExport: () -> Unit = {},
@@ -139,6 +152,7 @@ fun CameraScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     val haptic = LocalHapticFeedback.current
     val coroutineScope = rememberCoroutineScope()
+    val motion = motionScheme
 
     var hasCameraPermission by remember {
         mutableStateOf(
@@ -172,11 +186,57 @@ fun CameraScreen(
     var imageCaptureRef by remember { mutableStateOf<ImageCapture?>(null) }
     var cameraControlRef by remember { mutableStateOf<androidx.camera.core.CameraControl?>(null) }
     var linearTonemapActive by remember { mutableStateOf(false) }
+    var minZoomRatio by remember { mutableFloatStateOf(1.0f) }
+    var maxZoomRatio by remember { mutableFloatStateOf(5.0f) }
+    var isTakingPicture by remember { mutableStateOf(false) }
 
-    // Xenon flash screen burst state
+    // Dedicated single-thread executor for off-main-thread JPEG decoding
+    val captureExecutor = remember { Executors.newSingleThreadExecutor() }
+    DisposableEffect(captureExecutor) {
+        onDispose {
+            captureExecutor.shutdown()
+        }
+    }
+
+    // Live smoothed accelerometer roll-angle horizon indicator
+    var rollAngleDeg by remember { mutableFloatStateOf(0f) }
+    DisposableEffect(context) {
+        val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+        val accelerometer = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        val listener = if (sensorManager != null && accelerometer != null) {
+            object : SensorEventListener {
+                private var smoothedDeg = 0f
+                override fun onSensorChanged(event: SensorEvent) {
+                    val ax = event.values[0]
+                    val ay = event.values[1]
+                    val rawDeg = Math.toDegrees(atan2(ax.toDouble(), ay.toDouble())).toFloat()
+                    var delta = rawDeg - smoothedDeg
+                    while (delta > 180f) delta -= 360f
+                    while (delta < -180f) delta += 360f
+                    smoothedDeg += delta * 0.18f
+                    val relativeToLevel = ((smoothedDeg + 45f) % 90f + 90f) % 90f - 45f
+                    rollAngleDeg = relativeToLevel
+                }
+
+                override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+            }
+        } else {
+            null
+        }
+        if (listener != null && accelerometer != null) {
+            sensorManager.registerListener(listener, accelerometer, SensorManager.SENSOR_DELAY_UI)
+        }
+        onDispose {
+            if (listener != null) {
+                sensorManager?.unregisterListener(listener)
+            }
+        }
+    }
+
+    // Xenon flash screen burst state triggered on shutter press
     var flashBurstVisible by remember { mutableStateOf(false) }
-    LaunchedEffect(uiState.isCapturingPhoto) {
-        if (uiState.isCapturingPhoto && uiState.ispTuning.xenonFlashEnabled) {
+    LaunchedEffect(isTakingPicture) {
+        if (isTakingPicture && uiState.ispTuning.xenonFlashEnabled) {
             flashBurstVisible = true
             delay(160)
             flashBurstVisible = false
@@ -189,23 +249,31 @@ fun CameraScreen(
         label = "xenonBurstAlpha"
     )
 
-    val fallbackSceneBitmap = remember(uiState.selectedDemoSceneId) {
-        DemoSceneGenerator.generateSceneBitmap(uiState.selectedDemoSceneId, 960, 1280)
-    }
-
-    // Bind CameraX lifecycle
+    // Bind CameraX lifecycle with disposal guard, matching 4:3 preview selector, and zoom range clamp
     DisposableEffect(hasCameraPermission, uiState.isFrontCamera, previewViewRef) {
+        var isDisposed = false
+        var boundProvider: ProcessCameraProvider? = null
         val pv = previewViewRef
         if (hasCameraPermission && pv != null) {
             val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
             val executor = ContextCompat.getMainExecutor(context)
             val listener = Runnable {
+                if (isDisposed) return@Runnable
                 runCatching {
                     val provider = cameraProviderFuture.get()
+                    if (isDisposed) return@runCatching
+                    boundProvider = provider
+
+                    val previewSelector = ResolutionSelector.Builder()
+                        .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                        .build()
                     // STEP 1: Never attach NOISE_REDUCTION_MODE / EDGE_MODE to Preview
-                    val preview = Preview.Builder().build().also {
-                        it.surfaceProvider = pv.surfaceProvider
-                    }
+                    val preview = Preview.Builder()
+                        .setResolutionSelector(previewSelector)
+                        .build()
+                        .also {
+                            it.surfaceProvider = pv.surfaceProvider
+                        }
                     val highResSelector = ResolutionSelector.Builder()
                         .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
                         .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
@@ -238,18 +306,37 @@ fun CameraScreen(
                     provider.unbindAll()
                     val camera = provider.bindToLifecycle(lifecycleOwner, selector, preview, capture)
                     cameraControlRef = camera.cameraControl
-                    camera.cameraControl.setZoomRatio(uiState.digitalZoom.coerceAtLeast(1.0f))
+
+                    val zoomState = camera.cameraInfo.zoomState.value
+                    val minZ = (zoomState?.minZoomRatio ?: 1.0f).coerceAtLeast(0.5f)
+                    val maxZ = (zoomState?.maxZoomRatio ?: 5.0f).coerceAtLeast(minZ)
+                    minZoomRatio = minZ
+                    maxZoomRatio = maxZ
+
+                    val clampedZoom = uiState.digitalZoom.coerceIn(minZ, maxZ)
+                    if (abs(clampedZoom - uiState.digitalZoom) > 0.01f) {
+                        onSetZoom(clampedZoom)
+                    }
+                    camera.cameraControl.setZoomRatio(clampedZoom)
                     camera.cameraControl.setExposureCompensationIndex(0)
+                }.onFailure { err ->
+                    Log.e("ChronoCCD_Step1", "CameraX bind failed: ${err.message}", err)
+                    onCaptureError("Camera error: ${err.message ?: "unable to start viewfinder"}")
                 }
             }
             cameraProviderFuture.addListener(listener, executor)
         }
-        onDispose { }
+        onDispose {
+            isDisposed = true
+            runCatching { boundProvider?.unbindAll() }
+            imageCaptureRef = null
+            cameraControlRef = null
+        }
     }
 
-    LaunchedEffect(uiState.digitalZoom) {
+    LaunchedEffect(uiState.digitalZoom, minZoomRatio, maxZoomRatio) {
         runCatching {
-            cameraControlRef?.setZoomRatio(uiState.digitalZoom.coerceAtLeast(0.6f))
+            cameraControlRef?.setZoomRatio(uiState.digitalZoom.coerceIn(minZoomRatio, maxZoomRatio))
         }
     }
 
@@ -276,6 +363,25 @@ fun CameraScreen(
         )
     }
 
+    val zoomStops = remember(minZoomRatio, maxZoomRatio) {
+        buildList {
+            if (minZoomRatio <= 0.75f) {
+                val wide = if (minZoomRatio <= 0.55f) 0.5f else minZoomRatio
+                add(wide to ".5")
+            }
+            add(1.0f.coerceIn(minZoomRatio, maxZoomRatio) to "1×")
+            if (maxZoomRatio >= 2.0f) add(2.0f to "2")
+            if (maxZoomRatio >= 5.0f) add(5.0f to "5")
+            if (maxZoomRatio >= 10.0f) add(10.0f to "10")
+        }
+    }
+
+    val currentIndex = NostalgicDigicamCatalog.indexOfFirst {
+        it.id == uiState.selectedPersona.id
+    }.coerceAtLeast(0)
+    val prevPersona = NostalgicDigicamCatalog[(currentIndex - 1 + NostalgicDigicamCatalog.size) % NostalgicDigicamCatalog.size]
+    val nextPersona = NostalgicDigicamCatalog[(currentIndex + 1) % NostalgicDigicamCatalog.size]
+
     // Horizontal swipe state for switching between the 5 2000s looks
     val dragOffsetX = remember { Animatable(0f) }
     var swipeDirection by remember { mutableIntStateOf(1) }
@@ -283,37 +389,35 @@ fun CameraScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(Color.Black)
+            .background(colorScheme.surface)
             .padding(
                 top = contentPadding.calculateTopPadding() + 4.dp,
                 bottom = contentPadding.calculateBottomPadding() + 68.dp
             )
     ) {
-        // 1. Minimal Top Bar (matches RAW | 12MP ... icons from screenshot)
+        // 1. M3 Expressive Top Bar
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 24.dp, vertical = 6.dp)
+                .padding(horizontal = 20.dp, vertical = 6.dp)
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
                     text = "CCD",
+                    style = typography.labelLarge,
                     fontWeight = FontWeight.Bold,
-                    fontSize = 12.sp,
-                    color = Color.White,
+                    color = colorScheme.onSurface,
                     letterSpacing = 0.8.sp
                 )
 
-                // Dual-state resolution toggle: Mode Predetermined Res vs Full Sensor Resolution
                 ResolutionModeToggleBadge(
                     modeLabel = uiState.selectedPersona.megapixelLabel,
                     isFullSensorRes = uiState.ispTuning.useFullSensorResolution,
-                    accentColor = uiState.selectedPersona.accentColor,
                     onToggle = {
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         onToggleFullSensorResolution()
@@ -323,55 +427,34 @@ fun CameraScreen(
 
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                // Classic Timestamp toggle + format pill
-                Surface(
-                    shape = RoundedCornerShape(50),
-                    color = if (uiState.timestampConfig.enabled) {
-                        Color.White.copy(alpha = 0.16f)
-                    } else {
-                        Color.Transparent
+                ExpressiveTimestampPill(
+                    timestampConfig = uiState.timestampConfig,
+                    icon = Icons.Rounded.AccessTime,
+                    onToggle = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onToggleTimestamp()
                     },
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(50))
-                        .clickable {
-                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onToggleTimestamp()
-                        }
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.AccessTime,
-                            contentDescription = "Toggle Classic Timestamp",
-                            tint = if (uiState.timestampConfig.enabled) Color(0xFFFF6D2E) else Color.White.copy(alpha = 0.55f),
-                            modifier = Modifier.size(18.dp)
-                        )
-                        if (uiState.timestampConfig.enabled) {
-                            Spacer(Modifier.width(5.dp))
-                            Text(
-                                text = uiState.timestampConfig.formattedString(),
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = Color(0xFFFF6D2E),
-                                modifier = Modifier.clickable {
-                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    onCycleTimestampFormat()
-                                }
-                            )
-                        }
+                    onCycleFormat = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onCycleTimestampFormat()
                     }
-                }
+                )
 
-                // Xenon Flash Toggle Icon
-                IconButton(
-                    onClick = {
+                FilledTonalIconToggleButton(
+                    checked = uiState.ispTuning.xenonFlashEnabled,
+                    onCheckedChange = {
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         onToggleXenonFlash()
-                    }
+                    },
+                    shapes = IconButtonDefaults.toggleableShapes(),
+                    colors = IconButtonDefaults.filledTonalIconToggleButtonColors(
+                        containerColor = colorScheme.surfaceContainerHigh,
+                        contentColor = colorScheme.onSurfaceVariant,
+                        checkedContainerColor = colorScheme.primaryContainer,
+                        checkedContentColor = colorScheme.onPrimaryContainer
+                    )
                 ) {
                     Icon(
                         imageVector = if (uiState.ispTuning.xenonFlashEnabled) {
@@ -380,74 +463,53 @@ fun CameraScreen(
                             Icons.Rounded.FlashOff
                         },
                         contentDescription = "Toggle Xenon Flash",
-                        tint = if (uiState.ispTuning.xenonFlashEnabled) Color(0xFFFFE066) else Color.White.copy(alpha = 0.7f),
-                        modifier = Modifier.size(22.dp)
+                        modifier = Modifier.size(20.dp)
                     )
                 }
             }
         }
 
-        // 2. Huge Rounded Camera Preview (~78% of screen) + Left/Right Look Peek Strips
+        // 2. Rounded Camera Preview + Adjacent M3 Expressive Mode Peek Strips
         Box(
             contentAlignment = Alignment.Center,
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
         ) {
-            // Left Peeking Look Strip with '<' Chevron (matches screenshot)
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .align(Alignment.CenterStart)
-                    .width(15.dp)
-                    .fillMaxHeight(0.83f)
-                    .clip(RoundedCornerShape(topEnd = 16.dp, bottomEnd = 16.dp))
-                    .background(Color(0xFF2A2624).copy(alpha = 0.85f))
-                    .clickable {
-                        swipeDirection = -1
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onSwipePrevLook()
-                    }
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowLeft,
-                    contentDescription = "Previous Look",
-                    tint = Color.White.copy(alpha = 0.85f),
-                    modifier = Modifier.size(16.dp)
-                )
-            }
+            AdjacentModePeekStrip(
+                isLeft = true,
+                adjacentPersona = prevPersona,
+                icon = Icons.AutoMirrored.Rounded.KeyboardArrowLeft,
+                contentDescription = "Previous Look (${prevPersona.displayName})",
+                onClick = {
+                    swipeDirection = -1
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onSwipePrevLook()
+                },
+                modifier = Modifier.align(Alignment.CenterStart)
+            )
 
-            // Right Peeking Look Strip with '>' Chevron (matches screenshot)
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .align(Alignment.CenterEnd)
-                    .width(15.dp)
-                    .fillMaxHeight(0.83f)
-                    .clip(RoundedCornerShape(topStart = 16.dp, bottomStart = 16.dp))
-                    .background(Color(0xFF2A2624).copy(alpha = 0.85f))
-                    .clickable {
-                        swipeDirection = 1
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onSwipeNextLook()
-                    }
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
-                    contentDescription = "Next Look",
-                    tint = Color.White.copy(alpha = 0.85f),
-                    modifier = Modifier.size(16.dp)
-                )
-            }
+            AdjacentModePeekStrip(
+                isLeft = false,
+                adjacentPersona = nextPersona,
+                icon = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
+                contentDescription = "Next Look (${nextPersona.displayName})",
+                onClick = {
+                    swipeDirection = 1
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onSwipeNextLook()
+                },
+                modifier = Modifier.align(Alignment.CenterEnd)
+            )
 
             // Main Rounded Camera Preview Card
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(horizontal = 21.dp, vertical = 4.dp)
+                    .padding(horizontal = 22.dp, vertical = 4.dp)
                     .offset { IntOffset((dragOffsetX.value * 0.28f).roundToInt(), 0) }
                     .clip(RoundedCornerShape(34.dp))
-                    .background(Color(0xFF121212))
+                    .background(colorScheme.surfaceContainerLowest)
                     .onSizeChanged { viewfinderSize = it }
                     .pointerInput(uiState.selectedPersona.id) {
                         var totalDrag = 0f
@@ -476,31 +538,28 @@ fun CameraScreen(
                                 coroutineScope.launch {
                                     dragOffsetX.animateTo(
                                         targetValue = 0f,
-                                        animationSpec = spring(
-                                            dampingRatio = Spring.DampingRatioMediumBouncy,
-                                            stiffness = Spring.StiffnessMedium
-                                        )
+                                        animationSpec = motion.defaultSpatialSpec()
                                     )
                                 }
                             },
                             onDragCancel = {
                                 coroutineScope.launch {
-                                    dragOffsetX.animateTo(0f)
+                                    dragOffsetX.animateTo(0f, animationSpec = motion.defaultSpatialSpec())
                                 }
                             }
                         )
                     }
             ) {
-                // Live CameraX Preview or Fallback Scene with Real-Time 9-Stage AGSL Shader
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .graphicsLayer {
-                            renderEffect = liveShaderEffect
-                            clip = true
-                        }
-                ) {
-                    if (hasCameraPermission) {
+                if (hasCameraPermission) {
+                    // Live CameraX Preview with Real-Time AGSL Shader
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .graphicsLayer {
+                                renderEffect = liveShaderEffect
+                                clip = true
+                            }
+                    ) {
                         AndroidView(
                             factory = { ctx ->
                                 PreviewView(ctx).apply {
@@ -511,121 +570,167 @@ fun CameraScreen(
                             },
                             modifier = Modifier.fillMaxSize()
                         )
-                    } else {
-                        Image(
-                            bitmap = fallbackSceneBitmap.asImageBitmap(),
-                            contentDescription = "Camera Preview",
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
+                    }
+                } else {
+                    // Clean tap-to-grant Camera permission prompt
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clickable {
+                                cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                            }
+                            .padding(32.dp)
+                    ) {
+                        Surface(
+                            shape = CircleShape,
+                            color = colorScheme.secondaryContainer,
+                            modifier = Modifier.size(64.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = Icons.Rounded.CameraAlt,
+                                    contentDescription = null,
+                                    tint = colorScheme.onSecondaryContainer,
+                                    modifier = Modifier.size(30.dp)
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(16.dp))
+                        Text(
+                            text = "Camera access required",
+                            style = typography.titleMedium,
+                            color = colorScheme.onSurface
                         )
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = "Grant camera permission to use the live 2000s CCD viewfinder and shutter.",
+                            style = typography.bodyMedium,
+                            color = colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center
+                        )
+                        Spacer(Modifier.height(18.dp))
+                        FilledTonalButton(
+                            onClick = { cameraPermissionLauncher.launch(Manifest.permission.CAMERA) },
+                            shapes = ButtonDefaults.shapes()
+                        ) {
+                            Text("Grant Camera Permission")
+                        }
                     }
                 }
 
                 // Classic 7-Segment Quartz Timestamp Overlay in the Bottom Corner
-                ViewfinderQuartzTimestampOverlay(
-                    timestampConfig = uiState.timestampConfig,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(bottom = 58.dp)
-                )
+                if (hasCameraPermission) {
+                    ViewfinderQuartzTimestampOverlay(
+                        timestampConfig = uiState.timestampConfig,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(bottom = 58.dp)
+                    )
+                }
 
-                // Top-Center Translucent Look Pill (matches "Editorial" pill in screenshot)
-                Surface(
-                    shape = RoundedCornerShape(50),
-                    color = Color.Black.copy(alpha = 0.44f),
+                // Top-Center Camera Look Pill
+                CameraLookPill(
+                    persona = uiState.selectedPersona,
+                    swipeDirection = swipeDirection,
                     modifier = Modifier
                         .align(Alignment.TopCenter)
                         .padding(top = 14.dp)
-                ) {
-                    AnimatedContent(
-                        targetState = uiState.selectedPersona,
-                        transitionSpec = {
-                            (slideInHorizontally { width -> swipeDirection * (width / 2) } + fadeIn())
-                                .togetherWith(
-                                    slideOutHorizontally { width -> -swipeDirection * (width / 2) } + fadeOut()
-                                )
-                        },
-                        label = "lookNamePill"
-                    ) { persona ->
-                        Text(
-                            text = persona.displayName,
-                            style = typography.labelLarge,
-                            fontWeight = FontWeight.Medium,
-                            color = Color.White,
-                            modifier = Modifier.padding(horizontal = 18.dp, vertical = 8.dp)
-                        )
-                    }
-                }
+                )
 
-                // Subtle Center Level Horizon Line ("0°" from screenshot)
-                Box(
-                    contentAlignment = Alignment.Center,
-                    modifier = Modifier
-                        .align(Alignment.Center)
-                        .size(width = 160.dp, height = 28.dp)
-                ) {
-                    Canvas(modifier = Modifier.fillMaxSize()) {
-                        val cy = size.height / 2f
-                        drawLine(
-                            color = Color.White.copy(alpha = 0.65f),
-                            start = Offset(0f, cy),
-                            end = Offset(size.width * 0.40f, cy),
-                            strokeWidth = 1.5.dp.toPx()
-                        )
-                        drawLine(
-                            color = Color.White.copy(alpha = 0.65f),
-                            start = Offset(size.width * 0.60f, cy),
-                            end = Offset(size.width, cy),
-                            strokeWidth = 1.5.dp.toPx()
-                        )
-                    }
-                    Text(
-                        text = "0°",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Medium,
-                        color = Color.White.copy(alpha = 0.85f)
+                // Live Smoothed Accelerometer Roll-Angle Horizon Indicator
+                if (hasCameraPermission) {
+                    val roundedDeg = rollAngleDeg.roundToInt()
+                    val isLevel = abs(roundedDeg) <= 1
+                    val levelColor by animateColorAsState(
+                        targetValue = if (isLevel) colorScheme.tertiary else Color.White.copy(alpha = 0.72f),
+                        animationSpec = motion.fastEffectsSpec(),
+                        label = "horizonLevelColor"
                     )
-                }
-
-                // Bottom-Center Translucent Zoom Pill (.5 | 1× | 2 | 5 | 10 from screenshot)
-                Surface(
-                    shape = RoundedCornerShape(50),
-                    color = Color.Black.copy(alpha = 0.44f),
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = 16.dp)
-                ) {
-                    val zoomStops = listOf(
-                        0.6f to ".5",
-                        1.0f to "1×",
-                        2.0f to "2",
-                        5.0f to "5",
-                        10.0f to "10"
-                    )
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .size(width = 160.dp, height = 28.dp)
                     ) {
-                        zoomStops.forEach { (zoomVal, label) ->
-                            val isSelected = kotlin.math.abs(uiState.digitalZoom - zoomVal) < 0.25f
-                            Box(
-                                contentAlignment = Alignment.Center,
-                                modifier = Modifier
-                                    .size(38.dp)
-                                    .clip(CircleShape)
-                                    .background(if (isSelected) Color.White else Color.Transparent)
-                                    .clickable {
-                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                        onSetZoom(zoomVal)
-                                    }
-                            ) {
-                                Text(
-                                    text = if (isSelected && !label.endsWith("×")) "${label}×" else label,
-                                    fontSize = 13.sp,
-                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                    color = if (isSelected) Color.Black else Color.White
+                        Canvas(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .graphicsLayer { rotationZ = -rollAngleDeg }
+                        ) {
+                            val cy = size.height / 2f
+                            drawLine(
+                                color = levelColor,
+                                start = Offset(0f, cy),
+                                end = Offset(size.width * 0.38f, cy),
+                                strokeWidth = (if (isLevel) 2.dp else 1.5.dp).toPx()
+                            )
+                            drawLine(
+                                color = levelColor,
+                                start = Offset(size.width * 0.62f, cy),
+                                end = Offset(size.width, cy),
+                                strokeWidth = (if (isLevel) 2.dp else 1.5.dp).toPx()
+                            )
+                        }
+                        Text(
+                            text = "${roundedDeg}°",
+                            style = typography.labelSmall.copy(
+                                fontWeight = if (isLevel) FontWeight.Bold else FontWeight.Medium,
+                                fontFeatureSettings = "tnum"
+                            ),
+                            color = levelColor
+                        )
+                    }
+                }
+
+                // Bottom-Center Dynamic Supported Zoom Pill
+                if (hasCameraPermission && zoomStops.isNotEmpty()) {
+                    Surface(
+                        shape = RoundedCornerShape(50),
+                        color = colorScheme.surfaceContainerHigh.copy(alpha = 0.80f),
+                        border = BorderStroke(1.dp, colorScheme.outlineVariant.copy(alpha = 0.45f)),
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(bottom = 16.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp)
+                        ) {
+                            zoomStops.forEach { (zoomVal, label) ->
+                                val isSelected = abs(uiState.digitalZoom - zoomVal) < 0.25f
+                                val chipBg by animateColorAsState(
+                                    targetValue = if (isSelected) colorScheme.primary else Color.Transparent,
+                                    animationSpec = motion.fastEffectsSpec(),
+                                    label = "zoomChipBg"
                                 )
+                                val chipFg by animateColorAsState(
+                                    targetValue = if (isSelected) colorScheme.onPrimary else colorScheme.onSurface,
+                                    animationSpec = motion.fastEffectsSpec(),
+                                    label = "zoomChipFg"
+                                )
+                                Box(
+                                    contentAlignment = Alignment.Center,
+                                    modifier = Modifier
+                                        .size(38.dp)
+                                        .clip(CircleShape)
+                                        .background(chipBg)
+                                        .clickable {
+                                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            onSetZoom(zoomVal)
+                                        }
+                                ) {
+                                    Text(
+                                        text = if (isSelected && !label.endsWith("×")) "${label}×" else label,
+                                        style = typography.labelMedium.copy(
+                                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                            fontFeatureSettings = "tnum"
+                                        ),
+                                        color = chipFg
+                                    )
+                                }
                             }
                         }
                     }
@@ -642,7 +747,7 @@ fun CameraScreen(
             }
         }
 
-        // 3. Bottom Shutter Row (Thumbnail on Left, Big White Shutter in Center, Flip Camera on Right)
+        // 3. Bottom Shutter Row (Thumbnail + Queue Badge on Left, Hero Shutter in Center, Flip Camera on Right)
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -650,28 +755,19 @@ fun CameraScreen(
                 .fillMaxWidth()
                 .padding(horizontal = 42.dp, vertical = 14.dp)
         ) {
-            // Left: Rounded-Square Thumbnail (opens Editor or Photo Picker)
+            // Left: Expressive Squircle Thumbnail with Background Processing Indicator
             val thumbBitmap = uiState.processedBitmap ?: uiState.sourceBitmap
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .size(54.dp)
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(Color(0xFF232528))
-                    .border(
-                        width = 1.5.dp,
-                        color = Color.White.copy(alpha = 0.22f),
-                        shape = RoundedCornerShape(14.dp)
-                    )
-                    .clickable {
-                        if (uiState.capturedRoll.isNotEmpty() || uiState.processedBitmap != null) {
-                            onOpenEditor()
-                        } else {
-                            photoPickerLauncher.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                            )
-                        }
+            ExpressiveSideActionTile(
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    if (uiState.capturedRoll.isNotEmpty() || uiState.processedBitmap != null || uiState.sourceBitmap != null) {
+                        onOpenEditor()
+                    } else {
+                        photoPickerLauncher.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                        )
                     }
+                }
             ) {
                 if (thumbBitmap != null) {
                     Image(
@@ -684,89 +780,94 @@ fun CameraScreen(
                     Icon(
                         imageVector = Icons.Rounded.PhotoLibrary,
                         contentDescription = "Open Gallery",
-                        tint = Color.White,
+                        tint = colorScheme.onSurface,
                         modifier = Modifier.size(24.dp)
                     )
                 }
+
+                if (uiState.pendingCapturesCount > 0) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color.Black.copy(alpha = 0.52f))
+                    ) {
+                        CircularProgressIndicator(
+                            strokeWidth = 2.dp,
+                            color = colorScheme.primary,
+                            modifier = Modifier.size(26.dp)
+                        )
+                        Text(
+                            text = uiState.pendingCapturesCount.toString(),
+                            style = typography.labelSmall.copy(
+                                fontWeight = FontWeight.Bold,
+                                fontFeatureSettings = "tnum"
+                            ),
+                            color = Color.White
+                        )
+                    }
+                }
             }
 
-            // Center: Iconic Pixel Camera Circular Shutter Button
-            val shutterInteraction = remember { MutableInteractionSource() }
-            val isPressed by shutterInteraction.collectIsPressedAsState()
-            val shutterScale by animateFloatAsState(
-                targetValue = if (isPressed) 0.90f else 1.0f,
-                animationSpec = spring(stiffness = Spring.StiffnessHigh),
-                label = "shutterScale"
-            )
-
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .size(84.dp)
-                    .graphicsLayer {
-                        scaleX = shutterScale
-                        scaleY = shutterScale
-                    }
-                    .clip(CircleShape)
-                    .border(5.dp, Color(0xFF5F6368), CircleShape)
-                    .clickable(
-                        interactionSource = shutterInteraction,
-                        indication = null,
-                        enabled = !uiState.isCapturingPhoto
-                    ) {
-                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        val isLinearTonemap = linearTonemapActive
-                        if (hasCameraPermission) {
-                            val capture = imageCaptureRef
-                            val isFront = uiState.isFrontCamera
-                            if (capture != null) {
-                                // STEP 1: Strictly use the ImageCapture still, never the preview stream
-                                capture.takePicture(
-                                    ContextCompat.getMainExecutor(context),
-                                    object : ImageCapture.OnImageCapturedCallback() {
-                                        override fun onCaptureSuccess(image: ImageProxy) {
-                                            val bmp = imageProxyToBitmap(image, isFront)
-                                            image.close()
-                                            if (bmp != null) {
-                                                onCapturePhoto(bmp, "Camera", isLinearTonemap)
-                                            }
-                                        }
-
-                                        override fun onError(exception: ImageCaptureException) {
-                                            Log.e("ChronoCCD_Step1", "ImageCapture failed: ${exception.message}", exception)
+            // Center: M3 Expressive Hero Shutter Button (supports continuous background capture)
+            val shutterBusy = isTakingPicture || uiState.pendingCapturesCount >= ChronoCCDViewModel.MAX_PENDING_CAPTURES
+            ExpressiveHeroActionButton(
+                enabled = hasCameraPermission && !shutterBusy,
+                busy = shutterBusy,
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    val capture = imageCaptureRef
+                    val isFront = uiState.isFrontCamera
+                    val isLinearTonemap = linearTonemapActive
+                    if (capture != null) {
+                        isTakingPicture = true
+                        val mainExecutor = ContextCompat.getMainExecutor(context)
+                        // STEP 1: Strictly use the ImageCapture still, never the preview stream
+                        capture.takePicture(
+                            captureExecutor,
+                            object : ImageCapture.OnImageCapturedCallback() {
+                                override fun onCaptureSuccess(image: ImageProxy) {
+                                    val bmp = try {
+                                        imageProxyToBitmap(image, isFront)
+                                    } finally {
+                                        image.close()
+                                    }
+                                    mainExecutor.execute {
+                                        isTakingPicture = false
+                                        if (bmp != null) {
+                                            onCapturePhoto(bmp, "Camera", isLinearTonemap)
+                                        } else {
+                                            onCaptureError("Capture decode failed. Please try again.")
                                         }
                                     }
-                                )
-                            }
-                        } else {
-                            onCapturePhoto(fallbackSceneBitmap, "Camera", false)
-                        }
-                    }
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(68.dp)
-                        .clip(CircleShape)
-                        .background(Color.White)
-                )
-            }
+                                }
 
-            // Right: Rounded-Square Flip Camera Button (matches screenshot)
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .size(54.dp)
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(Color(0xFF282A2D))
-                    .clickable {
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onToggleCameraLens()
+                                override fun onError(exception: ImageCaptureException) {
+                                    Log.e("ChronoCCD_Step1", "ImageCapture failed: ${exception.message}", exception)
+                                    mainExecutor.execute {
+                                        isTakingPicture = false
+                                        onCaptureError("Capture failed: ${exception.message ?: "camera error"}")
+                                    }
+                                }
+                            }
+                        )
+                    } else {
+                        onCaptureError("Camera is still initializing…")
                     }
+                }
+            )
+
+            // Right: Expressive Squircle Flip Camera Tile
+            ExpressiveSideActionTile(
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onToggleCameraLens()
+                }
             ) {
                 Icon(
                     imageVector = Icons.Rounded.Sync,
                     contentDescription = "Switch Camera",
-                    tint = Color.White,
+                    tint = colorScheme.onSurface,
                     modifier = Modifier.size(26.dp)
                 )
             }
@@ -795,7 +896,7 @@ private fun configureImageCaptureWithCharacteristics(
     }.getOrNull() ?: return false
 
     val availableKeys = runCatching {
-        characteristics.availableCaptureRequestKeys?.toSet()
+        characteristics.availableCaptureRequestKeys.toSet()
     }.getOrNull() ?: emptySet()
 
     val extender = Camera2Interop.Extender(captureBuilder)
@@ -879,14 +980,41 @@ private fun configureImageCaptureWithCharacteristics(
 
 private fun imageProxyToBitmap(image: ImageProxy, isFrontCamera: Boolean = false): Bitmap? {
     return runCatching {
-        val raw = image.toBitmap()
+        val raw: Bitmap = if (image.format == ImageFormat.JPEG && image.planes.isNotEmpty()) {
+            val buffer = image.planes[0].buffer
+            val bytes = ByteArray(buffer.remaining())
+            buffer.get(bytes)
+
+            val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOpts)
+            var sampleSize = 1
+            if (boundsOpts.outWidth > 0 && boundsOpts.outHeight > 0) {
+                while (boundsOpts.outWidth / sampleSize > 4096 ||
+                    boundsOpts.outHeight / sampleSize > 4096
+                ) {
+                    sampleSize *= 2
+                }
+            }
+            val decodeOpts = BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts) ?: image.toBitmap()
+        } else {
+            image.toBitmap()
+        }
+
         val rotation = image.imageInfo.rotationDegrees.toFloat()
         if (rotation != 0f || isFrontCamera) {
             val matrix = Matrix().apply {
                 if (rotation != 0f) postRotate(rotation)
                 if (isFrontCamera) postScale(-1f, 1f)
             }
-            Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true)
+            val transformed = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true)
+            if (transformed !== raw) {
+                raw.recycle()
+            }
+            transformed
         } else {
             raw
         }

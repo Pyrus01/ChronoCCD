@@ -1,6 +1,8 @@
 package com.chronoccd.studio.ui.theme
 
 import android.app.Activity
+import android.app.UiModeManager
+import android.content.Context
 import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
@@ -14,6 +16,7 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -102,6 +105,19 @@ val darkScheme = darkColorScheme(
 val LocalDarkTheme = staticCompositionLocalOf { false }
 val LocalBlackTheme = staticCompositionLocalOf { false }
 
+@Composable
+private fun rememberSystemContrast(): Double {
+    val context = LocalContext.current
+    return remember(context) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            val uiModeManager = context.getSystemService(Context.UI_MODE_SERVICE) as? UiModeManager
+            uiModeManager?.contrast?.toDouble()?.coerceIn(-1.0, 1.0) ?: 0.0
+        } else {
+            0.0
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun ChronoCCDTheme(
@@ -111,6 +127,7 @@ fun ChronoCCDTheme(
     blackTheme: Boolean = false,
     content: @Composable () -> Unit
 ) {
+    val contrastLevel = rememberSystemContrast()
     val baseScheme = when {
         dynamicColor && seedColor == Color.White && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
             val context = LocalContext.current
@@ -136,7 +153,8 @@ fun ChronoCCDTheme(
         },
         isDark = darkTheme,
         specVersion = if (blackTheme && darkTheme) ColorSpec.SpecVersion.SPEC_2021 else ColorSpec.SpecVersion.SPEC_2025,
-        isAmoled = blackTheme && darkTheme
+        isAmoled = blackTheme && darkTheme,
+        contrastLevel = contrastLevel
     )
 
     val rawScheme =
@@ -168,6 +186,7 @@ fun SeededTheme(
     val appScheme = colorScheme
     val darkTheme = LocalDarkTheme.current
     val blackTheme = LocalBlackTheme.current
+    val contrastLevel = rememberSystemContrast()
 
     val seededScheme = rememberDynamicColorScheme(
         seedColor = when (seedColor) {
@@ -176,7 +195,8 @@ fun SeededTheme(
         },
         isDark = darkTheme,
         specVersion = if (blackTheme) ColorSpec.SpecVersion.SPEC_2021 else ColorSpec.SpecVersion.SPEC_2025,
-        isAmoled = blackTheme
+        isAmoled = blackTheme,
+        contrastLevel = contrastLevel
     )
 
     val scheme = animateColorScheme(
